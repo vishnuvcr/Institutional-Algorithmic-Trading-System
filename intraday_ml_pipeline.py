@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-INSTITUTIONAL INTRADAY ML ENGINE & PINE SCRIPT v6 GENERATOR (SHARDED)
-====================================================================
-- Explicit 2D probability slicing (no scalar conversion errors)
-- Guaranteed generation of 'strategy_v6.pine' and 'final_ranked_results.csv'
-- Comprehensive logging per ticker to console
+UNIVERSAL QUANTITATIVE ML ENGINE FOR INDIAN EQUITIES (NSE)
+==========================================================
+- Architecture: Pooled Cross-Sectional Machine Learning
+- Dataset: All NSE Equities Combined into a Single Universal Feature Matrix
+- Features: Dimensionless Causal Ratios (Cross-Asset Stationary)
+- Model: Single Universal Voting Ensemble (GBM + k-NN + Regularized Logistic)
+- Execution: Cross-Sectional Ranking & Pine Script v6 Integration
 """
 
 import os
 import sys
-import argparse
-import glob
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Optional
+from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
@@ -23,53 +23,60 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import HistGradientBoostingClassifier, VotingClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore")
 
-TARGET_PROFIT_PCT = 0.02        # 2.0% Target
-ATR_MULTIPLIER    = 1.50        # ATR Stop Loss Multiplier
-HORIZON_BARS      = 20          # Max forward bars (~5 hours on 15m)
-MIN_TRAIN_BARS    = 150         # Lookback threshold
-TEST_FOLD_BARS    = 30          # Walk-forward fold window
-MIN_CONFIDENCE    = 0.50        # Statistical Edge Threshold (50%+)
+# Universal Strategy Parameters
+TARGET_PROFIT_PCT = 0.025       # 2.5% Target (Intraday Horizon)
+ATR_MULTIPLIER    = 1.50        # Volatility Stop Loss Multiplier
+HORIZON_BARS      = 20          # Max forward bars (~5 hours of trading)
+MIN_BARS_PER_STOCK= 150         # Minimum bars required to include stock in pool
+MAX_POOL_STOCKS   = 60          # Number of liquid stocks to train the universal brain
 RISK_FREE_RATE    = 0.065       # Baseline rate (~6.5%)
 
 
 @dataclass
-class ScreenerOpportunity:
+class UniversalOpportunity:
     ticker: str
     direction: str
     entry_price: float
     target_price: float
     stop_loss: float
     risk_reward: float
-    ensemble_prob: float
-    historical_win_rate: float
-    max_drawdown: float
-    fitness_score: float
+    universal_prob: float
+    atr: float
 
 
-def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
+# =============================================================================
+# 1. DIMENSIONLESS CAUSAL FEATURE STORE (UNIVERSAL SCALE)
+# =============================================================================
+def build_dimensionless_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes pure dimensionless indicators. Regardless of whether a stock is
+    trading at Rs. 100 or Rs. 3,000, these features inhabit the exact same range.
+    """
     data = df.copy()
     close = data['Close']
     high = data['High']
     low = data['Low']
     volume = data['Volume']
 
-    # RSI
+    # 1. RSI (Scaled to -1.0 to +1.0)
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, min_periods=14).mean()
     rs = gain / (loss + 1e-9)
-    data['RSI'] = 100.0 - (100.0 / (1.0 + rs))
+    rsi_raw = 100.0 - (100.0 / (1.0 + rs))
+    data['RSI_Norm'] = (rsi_raw - 50.0) / 50.0
 
-    # Stochastic %K & %D
+    # 2. Stochastic %K (Scaled to -1.0 to +1.0)
     low_14 = low.rolling(14).min()
     high_14 = high.rolling(14).max()
-    data['Stoch_K'] = 100.0 * ((close - low_14) / (high_14 - low_14 + 1e-9))
-    data['Stoch_D'] = data['Stoch_K'].rolling(3).mean()
+    stoch_k = 100.0 * ((close - low_14) / (high_14 - low_14 + 1e-9))
+    data['Stoch_Norm'] = (stoch_k - 50.0) / 50.0
 
-    # ATR & NATR
+    # 3. Volatility: Normalized ATR (Percentage of Price)
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -77,34 +84,38 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data['ATR'] = tr.ewm(alpha=1/14, min_periods=14).mean()
     data['NATR'] = (data['ATR'] / close) * 100.0
 
-    # Bollinger Bands
+    # 4. Bollinger Band Position (%B centered at 0)
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std(ddof=1)
     bb_up = bb_mid + 2.0 * bb_std
     bb_low = bb_mid - 2.0 * bb_std
-    data['BB_PctB'] = (close - bb_low) / (bb_up - bb_low + 1e-9)
+    data['BB_Norm'] = ((close - bb_low) / (bb_up - bb_low + 1e-9)) - 0.5
 
-    # Money Flow Index
+    # 5. Money Flow Index (Scaled to -1.0 to +1.0)
     tp = (high + low + close) / 3.0
     rmf = tp * volume
     pos_flow = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     neg_flow = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
-    data['MFI'] = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
+    mfi_raw = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
+    data['MFI_Norm'] = (mfi_raw - 50.0) / 50.0
 
-    # EMA Ribbon
+    # 6. Trend Ribbon Spread (Percentage difference)
     ema8 = close.ewm(span=8, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema55 = close.ewm(span=55, adjust=False).mean()
-    data['EMA_Ribbon_Spread'] = (ema8 - ema55) / (ema55 + 1e-9)
-    data['EMA_Short_Spread'] = (ema8 - ema21) / (ema21 + 1e-9)
+    data['Ribbon_Spread'] = (ema8 - ema55) / (ema55 + 1e-9)
+    data['Fast_Spread'] = (ema8 - ema21) / (ema21 + 1e-9)
 
-    # Momentum Return
+    # 7. Short-Term Return
     data['ROC_4'] = close.pct_change(4)
 
     return data
 
 
-def generate_triple_barrier_labels(df: pd.DataFrame) -> pd.Series:
+# =============================================================================
+# 2. UNIVERSAL TRIPLE-BARRIER LABELING
+# =============================================================================
+def generate_universal_labels(df: pd.DataFrame) -> pd.Series:
     close = df['Close'].values
     high = df['High'].values
     low = df['Low'].values
@@ -113,198 +124,41 @@ def generate_triple_barrier_labels(df: pd.DataFrame) -> pd.Series:
     labels = np.zeros(n, dtype=int)
 
     for i in range(n - HORIZON_BARS):
-        entry_price = close[i]
-        target_price = entry_price * (1.0 + TARGET_PROFIT_PCT)
-        stop_price = entry_price - (atr[i] * ATR_MULTIPLIER)
+        entry_p = close[i]
+        target_p = entry_p * (1.0 + TARGET_PROFIT_PCT)
+        stop_p = entry_p - (atr[i] * ATR_MULTIPLIER)
 
         for h in range(1, HORIZON_BARS + 1):
-            if high[i + h] >= target_price:
+            if high[i + h] >= target_p:
                 labels[i] = 1
                 break
-            elif low[i + h] <= stop_price:
+            elif low[i + h] <= stop_p:
                 labels[i] = 0
                 break
         else:
-            labels[i] = 1 if close[i + HORIZON_BARS] > entry_price else 0
+            labels[i] = 1 if close[i + HORIZON_BARS] > entry_p else 0
 
     return pd.Series(labels, index=df.index)
 
 
-def build_ml_ensemble() -> VotingClassifier:
-    clf_gbm = HistGradientBoostingClassifier(max_iter=30, max_depth=3, learning_rate=0.05, random_state=42)
-    clf_knn = KNeighborsClassifier(n_neighbors=7, weights='distance', metric='manhattan')
-    clf_lr = LogisticRegression(C=0.1, max_iter=200, random_state=42)
+# =============================================================================
+# 3. TRAIN THE SINGLE UNIVERSAL ENSEMBLE
+# =============================================================================
+def build_universal_ensemble() -> VotingClassifier:
+    clf_gbm = HistGradientBoostingClassifier(max_iter=60, max_depth=4, learning_rate=0.05, random_state=42)
+    clf_knn = KNeighborsClassifier(n_neighbors=9, weights='distance', metric='manhattan')
+    clf_lr  = LogisticRegression(C=0.1, max_iter=300, random_state=42)
     return VotingClassifier(estimators=[('gbm', clf_gbm), ('knn', clf_knn), ('lr', clf_lr)], voting='soft')
 
 
-def run_walk_forward_validation(X: pd.DataFrame, y: pd.Series, df_raw: pd.DataFrame) -> Tuple[float, float, float]:
-    n_samples = len(X)
-    if n_samples < (MIN_TRAIN_BARS + TEST_FOLD_BARS):
-        return 50.0, 5.0, 0.05
-
-    oos_returns = []
-    oos_trades = 0
-    oos_wins = 0
-
-    close_arr = df_raw['Close'].values
-    high_arr = df_raw['High'].values
-    low_arr = df_raw['Low'].values
-    atr_arr = df_raw['ATR'].values
-
-    col_win = 1
-
-    for start_test in range(MIN_TRAIN_BARS, n_samples - TEST_FOLD_BARS, TEST_FOLD_BARS):
-        end_test = start_test + TEST_FOLD_BARS
-        purge_idx = start_test - HORIZON_BARS
-        X_train, y_train = X.iloc[:purge_idx], y.iloc[:purge_idx]
-        X_test = X.iloc[start_test:end_test]
-
-        if len(np.unique(y_train)) < 2:
-            continue
-
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-
-        model = build_ml_ensemble()
-        model.fit(X_train_scaled, y_train)
-
-        # Explicitly slice win probability column
-        test_probs = model.predict_proba(X_test_scaled)[:, col_win]
-
-        for i_local in range(len(test_probs)):
-            prob_val = float(test_probs[i_local])
-            if prob_val >= MIN_CONFIDENCE:
-                bar_idx = start_test + i_local
-                if bar_idx >= n_samples - HORIZON_BARS:
-                    continue
-
-                entry_p = close_arr[bar_idx]
-                target_p = entry_p * (1.0 + TARGET_PROFIT_PCT)
-                stop_p = entry_p - (atr_arr[bar_idx] * ATR_MULTIPLIER)
-
-                oos_trades += 1
-                trade_ret = 0.0
-
-                for step in range(1, HORIZON_BARS + 1):
-                    if high_arr[bar_idx + step] >= target_p:
-                        trade_ret = TARGET_PROFIT_PCT
-                        oos_wins += 1
-                        break
-                    elif low_arr[bar_idx + step] <= stop_p:
-                        trade_ret = (stop_p - entry_p) / entry_p
-                        break
-                else:
-                    trade_ret = (close_arr[bar_idx + HORIZON_BARS] - entry_p) / entry_p
-                    if trade_ret > 0:
-                        oos_wins += 1
-
-                oos_returns.append(trade_ret)
-
-    if oos_trades < 2:
-        return 50.0, 5.0, 0.05
-
-    win_rate = (oos_wins / oos_trades) * 100.0
-
-    eq_curve = [1.0]
-    for r in oos_returns:
-        eq_curve.append(eq_curve[-1] * (1.0 + r))
-    
-    eq_series = pd.Series(eq_curve)
-    drawdowns = (eq_series - eq_series.cummax()) / eq_series.cummax()
-    max_dd = abs(drawdowns.min()) * 100.0
-    if max_dd < 0.5:
-        max_dd = 0.5
-
-    total_ret = eq_series.iloc[-1] - 1.0
-    ann_ret = total_ret * (1500.0 / max(len(oos_returns), 1))
-
-    neg_rets = [r for r in oos_returns if r < 0]
-    downside_std = np.std(neg_rets) if len(neg_rets) > 1 else 0.01
-    sortino = (np.mean(oos_returns) * 1500.0 - RISK_FREE_RATE) / (downside_std * np.sqrt(1500) + 1e-9)
-    sortino = max(sortino, 0.0)
-
-    fitness = ((max(ann_ret, 0.0) * 100.0) / (max_dd ** 2)) * sortino
-
-    return win_rate, max_dd, fitness
-
-
-def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
-    clean_ticker = raw_ticker.strip().upper()
-    if not clean_ticker:
-        return None
-
-    yf_symbol = f"{clean_ticker}.NS"
-    try:
-        df = yf.download(yf_symbol, period="60d", interval="15m", progress=False)
-        if df is None or len(df) < MIN_TRAIN_BARS:
-            return None
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df_feat = build_feature_store(df).dropna()
-        if len(df_feat) < MIN_TRAIN_BARS:
-            return None
-
-        labels = generate_triple_barrier_labels(df_feat)
-
-        feature_cols = [
-            'RSI', 'Stoch_K', 'Stoch_D', 'NATR', 'BB_PctB', 
-            'MFI', 'EMA_Ribbon_Spread', 'EMA_Short_Spread', 'ROC_4'
-        ]
-
-        valid_indices = df_feat.index[:-HORIZON_BARS]
-        X_train_full = df_feat.loc[valid_indices, feature_cols]
-        y_train_full = labels.loc[valid_indices]
-
-        if len(np.unique(y_train_full)) < 2:
-            return None
-
-        win_rate, max_dd, fitness = run_walk_forward_validation(X_train_full, y_train_full, df_feat)
-
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train_full)
-        
-        ensemble = build_ml_ensemble()
-        ensemble.fit(X_train_scaled, y_train_full)
-
-        latest_features = df_feat.iloc[[-1]][feature_cols]
-        latest_scaled = scaler.transform(latest_features)
-        
-        # Explicitly extract row 0, column 1 (win probability)
-        proba_matrix = ensemble.predict_proba(latest_scaled)
-        row_first = 0
-        col_win = 1
-        live_prob = float(proba_matrix[row_first, col_win])
-
-        last_close = float(df_feat.iloc[-1]['Close'])
-        last_atr = float(df_feat.iloc[-1]['ATR'])
-        target_p = last_close * (1.0 + TARGET_PROFIT_PCT)
-        stop_p = last_close - (last_atr * ATR_MULTIPLIER)
-        rr_ratio = abs(target_p - last_close) / (abs(last_close - stop_p) + 1e-9)
-
-        return ScreenerOpportunity(
-            ticker=clean_ticker,
-            direction="BUY" if live_prob >= 0.50 else "WATCH",
-            entry_price=round(last_close, 2),
-            target_price=round(target_p, 2),
-            stop_loss=round(stop_p, 2),
-            risk_reward=round(rr_ratio, 2),
-            ensemble_prob=round(live_prob * 100.0, 1),
-            historical_win_rate=round(win_rate, 1),
-            max_drawdown=round(max_dd, 1),
-            fitness_score=round(fitness, 3)
-        )
-    except Exception as e:
-        print(f"[-] Evaluation note for {clean_ticker}: {e}")
-        return None
-
-
 def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
+    """
+    Generates the matching Universal Pine Script v6 Strategy.
+    Because features are normalized, the exact same script runs on ANY chart.
+    """
     pine_code = """//@version=6
-strategy("Institutional Quantitative Engine [v6]", 
-         shorttitle="QUANT_V6", 
+strategy("Universal Quantitative ML Engine [v6]", 
+         shorttitle="UNIV_ML_v6", 
          overlay=true, 
          initial_capital=1000000, 
          default_qty_type=strategy.percent_of_equity, 
@@ -314,22 +168,24 @@ strategy("Institutional Quantitative Engine [v6]",
          slippage=2,
          pyramiding=0)
 
-var string G_MODE       = "Operational Mode & Time Horizons"
+// 1. UNIVERSAL CONFIGURATION
+var string G_MODE       = "Universal Operational Mode"
 i_tradeMode             = input.string("Intraday (15m)", "Trading Mode", options=["Scalping (1m-5m)", "Intraday (15m)", "Swing (Daily)", "BTST (EOD)"], group=G_MODE)
 i_enableShorts          = input.bool(true, "Enable Short Trades", group=G_MODE)
 
-var string G_RISK       = "Risk & Position Controls"
+var string G_RISK       = "Universal Risk Controls"
 i_targetProfitPct       = input.float(2.0, "Take Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
 i_atrSlMultiplier       = input.float(1.50, "ATR Stop Loss Multiplier", minval=0.5, step=0.25, group=G_RISK)
 i_atrLength             = input.int(14, "ATR Length", minval=1, group=G_RISK)
 i_enableBreakeven       = input.bool(true, "Enable Breakeven Ratchet", group=G_RISK)
 i_breakevenTriggerPct   = input.float(1.2, "Breakeven Activation Gain (%)", minval=0.5, step=0.25, group=G_RISK)
 
-var string G_ML         = "Lorentzian Classification Parameters"
+var string G_ML         = "Universal Lorentzian Classifier"
 i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxval=50, group=G_ML)
-i_trainingWindow        = input.int(250, "Training Historical Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
-i_confidenceThresh      = input.float(52.0, "Minimum Model Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
+i_trainingWindow        = input.int(250, "Training Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
+i_confidenceThresh      = input.float(52.0, "Model Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
 
+// 2. UNIVERSAL FEATURE NORMALIZATION
 f_calc_rsi(int len) =>
     float rawRsi = ta.rsi(close, len)
     (rawRsi - 50.0) / 50.0
@@ -357,6 +213,7 @@ f3 = f_calc_tsi(25, 13)
 f4 = f_calc_mfi(14)
 f5 = f_calc_adx_diff(14)
 
+// 3. LORENTZIAN DISTANCE METRIC
 f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, 
                   float y1, float y2, float y3, float y4, float y5) =>
     float d1 = math.log(1.0 + math.abs(x1 - y1))
@@ -524,7 +381,7 @@ if barstate.islast
     table.cell(hud, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.navy)
     table.cell(hud, 1, 0, "Value",  text_color=color.white, text_size=size.small, bgcolor=color.navy)
     
-    table.cell(hud, 0, 1, "ML Confidence", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 0, 1, "Universal ML", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 1, str.tostring(modelConfidence, "#.#") + "%", 
                text_color=modelConfidence >= i_confidenceThresh ? color.lime : color.gray, text_size=size.small)
     
@@ -553,106 +410,161 @@ plotshape(modeConditionSell and not inShortPosition, title="Sell Signal", style=
     return pine_code
 
 
-def run_shard(shard_id: int, num_shards: int, ticker_file: str, output_csv: str) -> None:
+# =============================================================================
+# 4. MASTER ORCHESTRATION: INGEST -> POOL -> TRAIN ONCE -> SCORE ALL
+# =============================================================================
+def download_single_ticker(ticker: str) -> Optional[pd.DataFrame]:
+    clean_t = ticker.strip().upper()
+    yf_symbol = f"{clean_t}.NS"
+    try:
+        df = yf.download(yf_symbol, period="60d", interval="15m", progress=False)
+        if df is None or len(df) < MIN_BARS_PER_STOCK:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df_feat = build_dimensionless_features(df).dropna()
+        if len(df_feat) < MIN_BARS_PER_STOCK:
+            return None
+        df_feat['TICKER'] = clean_t
+        return df_feat
+    except Exception:
+        return None
+
+
+def main():
+    ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file):
-        print(f"[-] {ticker_file} not found.")
-        sys.exit(1)
+        sample_tickers = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "BHARTIARTL", 
+            "SBIN", "LICI", "ITC", "HINDUNILVR", "LT", "BAJFINANCE", 
+            "TATAMOTORS", "SUNPHARMA", "MARUTI", "JINDALSAW", "AXISBANK", 
+            "KOTAKBANK", "TITAN", "ULTRACEMCO"
+        ]
+        with open(ticker_file, "w") as f:
+            f.write("\n".join(sample_tickers))
 
     with open(ticker_file, "r") as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    shard_tickers = [t for i, t in enumerate(all_tickers) if (i % num_shards) == shard_id]
+    # Select representative pool for universal training
+    pool_tickers = all_tickers[:MAX_POOL_STOCKS]
 
-    print("=" * 90)
-    print(f"SHARD {shard_id + 1}/{num_shards}: PROCESSING {len(shard_tickers)} TICKERS")
-    print("=" * 90)
+    print("=" * 115)
+    print(f"UNIVERSAL ML ENGINE: INGESTING {len(pool_tickers)} LIQUID NSE EQUITIES INTO POOLED DATASET")
+    print("=" * 115)
 
-    opportunities: List[ScreenerOpportunity] = []
-    
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_map = {executor.submit(evaluate_ticker_ml, t): t for t in shard_tickers}
+    stock_dataframes: Dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {executor.submit(download_single_ticker, t): t for t in pool_tickers}
         for future in as_completed(future_map):
+            t = future_map[future]
             res = future.result()
             if res is not None:
-                opportunities.append(res)
-                print(f"[+] Evaluated: {res.ticker:<10} | Prob: {res.ensemble_prob}% | WinRate: {res.historical_win_rate}% | Fitness: {res.fitness_score}")
+                stock_dataframes[t] = res
+                print(f"[+] Ingested {t:<12}: {len(res)} 15m bars")
 
-    empty_cols = ["ticker", "direction", "entry_price", "target_price", "stop_loss", 
-                  "risk_reward", "ensemble_prob", "historical_win_rate", "max_drawdown", "fitness_score"]
-
-    if opportunities:
-        df_out = pd.DataFrame([asdict(o) for o in opportunities])
-        df_out.to_csv(output_csv, index=False)
-        print(f"[+] Shard {shard_id} saved {len(opportunities)} evaluated tickers to {output_csv}")
-    else:
-        pd.DataFrame(columns=empty_cols).to_csv(output_csv, index=False)
-        print(f"[-] Shard {shard_id}: No data returned.")
-
-
-def merge_and_display() -> None:
-    print("\n" + "=" * 115)
-    print(f"{'MERGING ALL SHARD ARTIFACTS & COMPUTING MASTER RANKING':^115}")
-    print("=" * 115)
-
-    # UNCONDITIONALLY GENERATE PINE SCRIPT v6 SO ARTIFACT UPLOAD NEVER FAILS
-    generate_pine_script_v6("strategy_v6.pine")
-    print("[+] Successfully generated 'strategy_v6.pine'.")
-
-    empty_cols = ["ticker", "direction", "entry_price", "target_price", "stop_loss", 
-                  "risk_reward", "ensemble_prob", "historical_win_rate", "max_drawdown", "fitness_score"]
-
-    csv_files = glob.glob("results_shard_*.csv")
-    dfs = []
-    for f in csv_files:
-        try:
-            if os.path.exists(f) and os.path.getsize(f) > 0:
-                df_temp = pd.read_csv(f)
-                if not df_temp.empty and "fitness_score" in df_temp.columns:
-                    dfs.append(df_temp)
-        except Exception:
-            pass
-
-    if not dfs:
-        print("[-] No records found across shards.")
-        pd.DataFrame(columns=empty_cols).to_csv("final_ranked_results.csv", index=False)
+    if len(stock_dataframes) < 3:
+        print("[-] Insufficient data downloaded to construct universal model.")
+        generate_pine_script_v6("strategy_v6.pine")
+        pd.DataFrame().to_csv("final_ranked_results.csv", index=False)
         return
 
-    merged_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["ticker"])
-    merged_df.sort_values(by="fitness_score", ascending=False, inplace=True)
-    merged_df.to_csv("final_ranked_results.csv", index=False)
+    # 1. POOL ALL HISTORICAL DATA ACROSS STOCKS
+    feature_cols = ['RSI_Norm', 'Stoch_Norm', 'NATR', 'BB_Norm', 'MFI_Norm', 'Ribbon_Spread', 'Fast_Spread', 'ROC_4']
+    
+    training_x_list = []
+    training_y_list = []
+    latest_rows = {}
 
-    print("\n" + "=" * 115)
-    print(f"{'TOP INTRADAY MACHINE LEARNING CANDIDATES (NSE)':^115}")
-    print("=" * 115)
-    header = f"{'Ticker':<12}{'Signal':<6}{'Entry (₹)':<12}{'Target':<14}{'Stop Loss':<12}{'R:R':<8}{'ML Prob (%)':<14}{'OOS Win %':<12}{'Max DD %':<10}{'Fitness':<10}"
-    print(header)
+    for t, df_stock in stock_dataframes.items():
+        labels = generate_universal_labels(df_stock)
+        valid_indices = df_stock.index[:-HORIZON_BARS]
+        
+        X_stock = df_stock.loc[valid_indices, feature_cols]
+        y_stock = labels.loc[valid_indices]
+        
+        training_x_list.append(X_stock)
+        training_y_list.append(y_stock)
+        
+        # Save latest bar for live ranking
+        latest_rows[t] = df_stock.iloc[[-1]]
+
+    X_universal = pd.concat(training_x_list, ignore_index=True)
+    y_universal = pd.concat(training_y_list, ignore_index=True)
+
     print("-" * 115)
-    for _, row in merged_df.head(25).iterrows():
-        print(f"{row['ticker']:<12}{row['direction']:<6}{row['entry_price']:<12.2f}{row['target_price']:<14.2f}"
-              f"{row['stop_loss']:<12.2f}{row['risk_reward']:<8.2f}{row['ensemble_prob']:<14.1f}"
-              f"{row['historical_win_rate']:<12.1f}{row['max_drawdown']:<10.1f}{row['fitness_score']:<10.3f}")
+    print(f"[*] TOTAL UNIVERSAL TRAINING POOL: {len(X_universal):,} BARS ACROSS {len(stock_dataframes)} STOCKS")
+    print(f"[*] Class Distribution: Bullish Setups: {sum(y_universal == 1):,} | Other: {sum(y_universal == 0):,}")
+    print("[-] Training Single Universal Multi-Model Ensemble...")
 
-    print("=" * 115)
-    tv_symbols = ", ".join([f"NSE:{t}" for t in merged_df['ticker'].head(25).tolist()])
-    print("TRADINGVIEW WATCHLIST EXPORT:")
+    # 2. FIT THE SINGLE UNIVERSAL MODEL ON THE ENTIRE POOL
+    scaler = StandardScaler()
+    X_universal_scaled = scaler.fit_transform(X_universal)
+
+    universal_model = build_universal_ensemble()
+    universal_model.fit(X_universal_scaled, y_universal)
+    print("[+] Universal Model Training Complete!")
+    print("-" * 115)
+
+    # 3. SCORE EVERY STOCK USING THE EXACT SAME UNIVERSAL BRAIN
+    opportunities: List[UniversalOpportunity] = []
+    row_first = 0
+    col_win = 1
+
+    for t, row_df in latest_rows.items():
+        feat_vals = row_df[feature_cols]
+        feat_scaled = scaler.transform(feat_vals)
+        
+        # Extract universal win probability
+        probs = universal_model.predict_proba(feat_scaled)
+        live_prob = float(probs[row_first, col_win])
+
+        last_close = float(row_df['Close'].iloc[0])
+        last_atr   = float(row_df['ATR'].iloc[0])
+        target_p   = last_close * (1.0 + TARGET_PROFIT_PCT)
+        stop_p     = last_close - (last_atr * ATR_MULTIPLIER)
+        risk_r     = abs(target_p - last_close) / (abs(last_close - stop_p) + 1e-9)
+
+        opp = UniversalOpportunity(
+            ticker=t,
+            direction="BUY" if live_prob >= 0.50 else "WATCH",
+            entry_price=round(last_close, 2),
+            target_price=round(target_p, 2),
+            stop_loss=round(stop_p, 2),
+            risk_reward=round(risk_r, 2),
+            universal_prob=round(live_prob * 100.0, 1),
+            atr=round(last_atr, 2)
+        )
+        opportunities.append(opp)
+
+    # Sort cross-sectionally by Universal Probability
+    opportunities.sort(key=lambda x: x.universal_prob, reverse=True)
+
+    # Save to CSV
+    df_out = pd.DataFrame([asdict(o) for o in opportunities])
+    df_out.to_csv("final_ranked_results.csv", index=False)
+    print("[+] Saved Master Cross-Sectional Ranking to 'final_ranked_results.csv'")
+
+    # Print Master Ranked Table
+    print("\n" + "=" * 105)
+    print(f"{'MASTER CROSS-SECTIONAL UNIVERSAL ML RANKING (NSE 15m)':^105}")
+    print("=" * 105)
+    header = f"{'Rank':<6}{'Ticker':<14}{'Signal':<8}{'Entry (₹)':<12}{'Target (+2.5%)':<16}{'Stop Loss':<12}{'R:R':<8}{'Universal Prob':<16}{'ATR':<8}"
+    print(header)
+    print("-" * 105)
+    for rank, o in enumerate(opportunities, start=1):
+        print(f"{rank:<6}{o.ticker:<14}{o.direction:<8}{o.entry_price:<12.2f}{o.target_price:<16.2f}"
+              f"{o.stop_loss:<12.2f}{o.risk_reward:<8.2f}{o.universal_prob:<16.1f}%{o.atr:<8.2f}")
+
+    print("=" * 105)
+    tv_symbols = ", ".join([f"NSE:{o.ticker}" for o in opportunities[:20]])
+    print("TOP 20 TRADINGVIEW WATCHLIST IMPORT STRING:")
     print(tv_symbols)
-    print("=" * 115)
+    print("=" * 105)
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Distributed Intraday ML Engine")
-    parser.add_argument("--shard-id", type=int, default=0)
-    parser.add_argument("--num-shards", type=int, default=1)
-    parser.add_argument("--ticker-file", type=str, default="tickers.txt")
-    parser.add_argument("--output-csv", type=str, default="shard_results.csv")
-    parser.add_argument("--merge", action="store_true")
-
-    args = parser.parse_args()
-
-    if args.merge:
-        merge_and_display()
-    else:
-        run_shard(args.shard_id, args.num_shards, args.ticker_file, args.output_csv)
+    # 4. GENERATE UNIVERSAL PINE SCRIPT v6
+    generate_pine_script_v6("strategy_v6.pine")
+    print("\n[+] Generated Universal 'strategy_v6.pine' for TradingView.")
 
 
 if __name__ == "__main__":
