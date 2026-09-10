@@ -1,0 +1,27 @@
+name: NSE Intraday ML Screener
+
+on:
+  workflow_dispatch: # Allows manual 1-click execution anytime
+  schedule:
+    # Runs Monday to Friday at 09:30 AM IST (04:00 UTC) and 01:30 PM IST (08:00 UTC)
+    - cron: '0 4 * * 1-5'
+    - cron: '0 8 * * 1-5'
+
+jobs:
+  run-ml-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute Intraday ML Pipeline
+        run: python intraday_ml_pipeline.py
