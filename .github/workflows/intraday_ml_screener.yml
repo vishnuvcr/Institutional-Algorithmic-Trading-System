@@ -1,4 +1,4 @@
-name: NSE Intraday ML Screener (Sharded)
+name: Universal NSE ML Screener
 
 on:
   workflow_dispatch: # Manual 1-click execution
@@ -8,20 +8,8 @@ on:
     - cron: '0 8 * * 1-5'
 
 jobs:
-  # =========================================================================
-  # 1. PARALLEL SHARD PROCESSING (4 Cloud VMs running concurrently)
-  # =========================================================================
-  screen-shards:
+  run-universal-engine:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          - 0
-          - 1
-          - 2
-          - 3
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -35,56 +23,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Execute Shard ${{ matrix.shard }}
-        run: |
-          python intraday_ml_pipeline.py \
-            --shard-id ${{ matrix.shard }} \
-            --num-shards 4 \
-            --ticker-file tickers.txt \
-            --output-csv results_shard_${{ matrix.shard }}.csv
+      - name: Execute Universal ML Engine
+        run: python intraday_ml_pipeline.py
 
-      - name: Upload Shard CSV Artifact
+      - name: Upload Universal Pine Script v6 Strategy
         uses: actions/upload-artifact@v4
         with:
-          name: shard-artifact-${{ matrix.shard }}
-          path: results_shard_${{ matrix.shard }}.csv
-          retention-days: 1
-
-  # =========================================================================
-  # 2. AGGREGATOR JOB (Merges results, outputs table, generates Pine Script)
-  # =========================================================================
-  aggregate-and-export:
-    needs: screen-shards
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Download all Shard Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: shard-artifact-*
-          merge-multiple: true
-
-      - name: Merge Results & Produce Pine Script v6
-        run: python intraday_ml_pipeline.py --merge
-
-      - name: Upload Final Pine Script v6 Strategy
-        uses: actions/upload-artifact@v4
-        with:
-          name: tradingview-pine-script-v6
+          name: universal-pine-script-v6
           path: strategy_v6.pine
           retention-days: 7
 
-      - name: Upload Final Ranked CSV
+      - name: Upload Master Ranked CSV
         uses: actions/upload-artifact@v4
         with:
           name: final-ranked-results-csv
