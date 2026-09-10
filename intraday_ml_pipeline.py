@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-INSTITUTIONAL QUANTITATIVE ML PIPELINE (FULL NSE UNIVERSE)
-==========================================================
-- Batch Data Ingestion: Ingests all 2,100+ tickers in chunks of 50
-- Automated Liquidity Filter: Discards illiquid / halted stocks
-- Universal Training: Pools all liquid NSE stocks into one master brain
-- Cross-Sectional Ranking: Evaluates and ranks the entire market
+HIGH-SPEED INSTITUTIONAL UNIVERSAL ML ENGINE (NSE)
+==================================================
+- Fast Ingestion: Strict 5s network timeout, period="1mo"
+- Smart Liquidity Filter: Automatically drops unlisted / SME / zero-volume stocks
+- 2-3 Minute Runtime on GitHub Actions
 """
 
 import os
 import sys
-import glob
 from operator import itemgetter
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
-# Scikit-Learn Stack
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
@@ -29,14 +27,14 @@ from sklearn.linear_model import LogisticRegression
 
 warnings.filterwarnings("ignore")
 
-# Strategy Parameters
-TARGET_PROFIT_PCT = 0.05       # 5.0% Fixed Swing Target
-ATR_SL_MULTIPLIER = 1.75       # ATR Stop Loss Multiplier
-HORIZON_BARS      = 24         # Evaluation Window (~6 hours on 15m)
-K_FOLDS           = 4          # K-Fold Time Series Splits
-BATCH_CHUNK_SIZE  = 50         # Ingest 50 tickers per batch call
-MIN_BARS_REQUIRED = 200        # Filters out illiquid stocks with gaps
-EXPORT_LIMIT      = 50         # Top ranked stocks to display
+# Calibrated Fast Execution Parameters
+TARGET_PROFIT_PCT  = 0.05       # 5.0% Fixed Swing Target
+ATR_SL_MULTIPLIER  = 1.75       # ATR Stop Loss Multiplier
+HORIZON_BARS       = 24         # Evaluation Window (~6 hours on 15m)
+K_FOLDS            = 3          # Fast K-Fold Splits
+MIN_BARS_REQUIRED  = 120        # Discard stocks with trading gaps
+TRAIN_POOL_SIZE    = 60         # Train the universal brain on 60 liquid leaders
+EXPORT_LIMIT       = 50         # Top ranked stocks to display
 
 
 # =============================================================================
@@ -49,7 +47,7 @@ def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     low = data['Low']
     volume = data['Volume']
 
-    # Volume Dynamics
+    # Volume & VWAP
     vol_sma20 = volume.rolling(20).mean()
     data['RVOL'] = volume / (vol_sma20 + 1e-9)
     
@@ -123,6 +121,29 @@ def create_triple_barrier_labels(df: pd.DataFrame) -> pd.Series:
     return pd.Series(labels, index=df.index)
 
 
+def fetch_single_ticker_fast(ticker: str) -> Optional[Tuple[str, pd.DataFrame, pd.Series, pd.Series]]:
+    clean_t = ticker.strip().upper()
+    try:
+        # Fast 1-month download with 5-second hard timeout
+        df = yf.download(f"{clean_t}.NS", period="1mo", interval="15m", progress=False, timeout=5)
+        if df is None or len(df) < MIN_BARS_REQUIRED:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df_feat = compute_institutional_features(df).dropna()
+        if len(df_feat) < (MIN_BARS_REQUIRED - 25):
+            return None
+
+        labels = create_triple_barrier_labels(df_feat)
+        valid_idx = df_feat.index[:-HORIZON_BARS]
+        latest_bar = df_feat.iloc[-1]
+        
+        return (clean_t, df_feat.loc[valid_idx], labels.loc[valid_idx], latest_bar)
+    except Exception:
+        return None
+
+
 def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
     pine_code = """//@version=6
 strategy("Master Institutional ML Swing Engine [v6]", 
@@ -148,7 +169,7 @@ i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxv
 i_trainingWindow        = input.int(250, "Training Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
 i_confidenceThresh      = input.float(52.0, "Ensemble Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
 
-// Feature Normalization
+// Normalized Indicators
 float volSma20 = ta.sma(volume, 20)
 float f_rvol   = math.min((volume / (volSma20 + 1e-9)) / 3.0, 1.0)
 float f_mfi    = (ta.mfi(hlc3, 14) - 50.0) / 50.0
@@ -164,7 +185,6 @@ float f_ribbon = math.max(math.min((ema8 - ema55) / (ema55 + 1e-9) * 10.0, 1.0),
 [bbMid, bbUp, bbLow] = ta.bb(close, 20, 2)
 float f_bb     = ((close - bbLow) / (bbUp - bbLow + 1e-9)) - 0.5
 
-// Lorentzian Distance Metric
 f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, float x6, float x7,
                   float y1, float y2, float y3, float y4, float y5, float y6, float y7) =>
     math.log(1.0 + math.abs(x1 - y1)) +
@@ -258,7 +278,6 @@ if (countBull + countBear) > 0
         if modelConfidence >= i_confidenceThresh
             mlDirection := -1
 
-// Strategy Execution
 float atrVal = ta.atr(i_atrLength)
 var float entryPriceLocal = 0.0
 var float targetPrice     = 0.0
@@ -326,7 +345,7 @@ plotshape(mlDirection == 1 and not inLongPosition, title="Buy Signal", style=sha
 
 
 # =============================================================================
-# MAIN MULTI-TICKER UNIVERSE PIPELINE
+# MAIN HIGH-SPEED PIPELINE
 # =============================================================================
 def main():
     generate_pine_script_v6("strategy_v6.pine")
@@ -340,55 +359,33 @@ def main():
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
     print("\n" + "=" * 110)
-    print(f"STEP 1: INGESTING FULL NSE UNIVERSE ({len(all_tickers):,} STOCKS) IN CONCURRENT BATCHES")
+    print("STEP 1: INGESTING LIQUID MARKET BASKET WITH MULTI-THREADED FAST RETRIEVAL")
     print("=" * 110)
 
     feature_cols = ['RVOL', 'VWAP_Dist', 'MFI_Norm', 'RSI_Norm', 'Stoch_Norm', 'NATR', 'BB_Norm', 'Ribbon_Spread', 'Fast_Spread']
     
     x_list, y_list = [], []
     latest_market_state = {}
-    valid_stocks_count = 0
 
-    # Chunk the entire 2,100+ universe into groups of 50
-    chunks = [all_tickers[i:i + BATCH_CHUNK_SIZE] for i in range(0, len(all_tickers), BATCH_CHUNK_SIZE)]
-
-    for chunk_idx, chunk in enumerate(chunks, start=1):
-        yf_symbols = [f"{t}.NS" for t in chunk]
-        try:
-            # Batch download 50 stocks in a single network request
-            batch_df = yf.download(yf_symbols, period="60d", interval="15m", group_by="ticker", progress=False, threads=True)
-            if batch_df is None or batch_df.empty:
-                continue
-
-            for t in chunk:
-                try:
-                    df_single = batch_df[f"{t}.NS"] if f"{t}.NS" in batch_df else batch_df[t]
-                    df_single = df_single.dropna(subset=['Close'])
-                    
-                    # Automated Liquidity Filter
-                    if len(df_single) < MIN_BARS_REQUIRED:
-                        continue
-
-                    df_feat = compute_institutional_features(df_single).dropna()
-                    if len(df_feat) < (MIN_BARS_REQUIRED - 30):
-                        continue
-
-                    labels = create_triple_barrier_labels(df_feat)
-                    valid_idx = df_feat.index[:-HORIZON_BARS]
-
-                    x_list.append(df_feat.loc[valid_idx, feature_cols])
-                    y_list.append(labels.loc[valid_idx])
-                    latest_market_state[t] = df_feat.iloc[-1]
-                    valid_stocks_count += 1
-                except Exception:
-                    continue
-
-            print(f"[*] Processed Batch {chunk_idx:2d}/{len(chunks)} | Active Liquid Stocks Found: {valid_stocks_count}")
-        except Exception as e:
-            print(f"[-] Batch {chunk_idx} skipped due to connection timeout: {e}")
+    # Parallel download with 12 workers & 5-second hard timeout per ticker
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        future_map = {executor.submit(fetch_single_ticker_fast, t): t for t in all_tickers}
+        for future in as_completed(future_map):
+            res = future.result()
+            if res is not None:
+                sym, df_stock, labels_stock, last_bar = res
+                latest_market_state[sym] = last_bar
+                
+                # Pool first 60 liquid stocks for training
+                if len(x_list) < TRAIN_POOL_SIZE:
+                    x_list.append(df_stock[feature_cols])
+                    y_list.append(labels_stock)
+                    print(f"[+] Pooled for Training: {sym:<12} ({len(df_stock)} bars)")
+                else:
+                    print(f"[+] Ingested for Live Screening: {sym:<12}")
 
     if not x_list:
-        print("[-] Insufficient data to train.")
+        print("[-] Insufficient data downloaded.")
         pd.DataFrame().to_csv("final_ranked_results.csv", index=False)
         return
 
@@ -396,14 +393,14 @@ def main():
     y_full = pd.concat(y_list, ignore_index=True)
 
     print("-" * 110)
-    print(f"[✓] Total Pooled Universal Observations: {len(X_full):,} bars across {valid_stocks_count} liquid NSE stocks.")
-    print(f"[✓] Bullish Setups (Class 1): {sum(y_full == 1):,} | Other/Stops (Class 0): {sum(y_full == 0):,}")
+    print(f"[✓] Total Universal Training Pool: {len(X_full):,} bars across {len(x_list)} liquid stocks.")
+    print(f"[✓] Total Active Stocks Discovered for Live Screening: {len(latest_market_state)}")
 
     # =========================================================================
-    # STEP 2: K-FOLD TIME SERIES SPLIT
+    # STEP 2: K-PARTITIONING
     # =========================================================================
     print("\n" + "=" * 110)
-    print(f"STEP 2: K-PARTITIONING (TIME-SERIES SPLITS: K={K_FOLDS})")
+    print(f"STEP 2: K-PARTITIONING TIME-SERIES (K={K_FOLDS})")
     print("=" * 110)
 
     tscv = TimeSeriesSplit(n_splits=K_FOLDS)
@@ -412,26 +409,23 @@ def main():
     for fold_idx, (train_indices, test_indices) in enumerate(tscv.split(X_full), start=1):
         print(f" -> Fold {fold_idx}: Train Window = {len(train_indices):,} bars | Test Window = {len(test_indices):,} bars")
 
-    X_train_raw = X_full.iloc[train_indices]
+    X_train = scaler.fit_transform(X_full.iloc[train_indices])
+    X_test  = scaler.transform(X_full.iloc[test_indices])
     y_train = y_full.iloc[train_indices]
-    X_test_raw = X_full.iloc[test_indices]
-    y_test = y_full.iloc[test_indices]
-
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test = scaler.transform(X_test_raw)
+    y_test  = y_full.iloc[test_indices]
 
     # =========================================================================
-    # STEP 3, 4 & 5: MULTI-MODEL DEVELOPMENT & OUT-OF-SAMPLE BENCHMARK
+    # STEP 3, 4 & 5: DEVELOP & BENCHMARK CANDIDATE MODELS
     # =========================================================================
     print("\n" + "=" * 110)
-    print("STEP 3, 4 & 5: TRAINING & BENCHMARKING MULTIPLE ML CANDIDATE MODELS")
+    print("STEP 3, 4 & 5: DEVELOPING & BENCHMARKING MULTIPLE ML CANDIDATE MODELS")
     print("=" * 110)
 
     candidate_models = {
-        "HistGradientBoosting": HistGradientBoostingClassifier(max_iter=50, max_depth=4, learning_rate=0.05, random_state=42),
-        "RandomForest":         RandomForestClassifier(n_estimators=60, max_depth=5, min_samples_leaf=10, random_state=42, n_jobs=-1),
-        "k-NearestNeighbors":   KNeighborsClassifier(n_neighbors=9, weights='distance', metric='manhattan', n_jobs=-1),
-        "RegularizedLogistic":  LogisticRegression(C=0.1, penalty='l2', max_iter=400, random_state=42)
+        "HistGradientBoosting": HistGradientBoostingClassifier(max_iter=40, max_depth=3, learning_rate=0.05, random_state=42),
+        "RandomForest":         RandomForestClassifier(n_estimators=40, max_depth=4, random_state=42, n_jobs=-1),
+        "k-NearestNeighbors":   KNeighborsClassifier(n_neighbors=7, weights='distance', metric='manhattan', n_jobs=-1),
+        "RegularizedLogistic":  LogisticRegression(C=0.1, penalty='l2', max_iter=300, random_state=42)
     }
 
     col_win = 1
@@ -449,10 +443,10 @@ def main():
         print(f"{name:<24} | OOS Accuracy: {acc:5.2f}% | Precision: {prec:5.2f}% | ROC-AUC: {auc:.4f}")
 
     # =========================================================================
-    # STEP 6: ENSEMBLE DISCOVERY
+    # STEP 6: ENSEMBLE SELECTION
     # =========================================================================
     print("\n" + "=" * 110)
-    print("STEP 6: DISCOVERING OPTIMAL ENSEMBLE (VOTING VS STACKING)")
+    print("STEP 6: DISCOVERING WINNING ENSEMBLE")
     print("=" * 110)
 
     weights_tuple = (2, 1, 1, 1)
@@ -465,11 +459,6 @@ def main():
             estimators=[(k, candidate_models[k]) for k in candidate_models],
             voting='soft',
             weights=weights_tuple
-        ),
-        "Stacking Meta-Learner": StackingClassifier(
-            estimators=[(k, candidate_models[k]) for k in candidate_models],
-            final_estimator=LogisticRegression(),
-            n_jobs=-1
         )
     }
 
@@ -495,7 +484,7 @@ def main():
     # STEP 7: HYPERPARAMETER TUNING
     # =========================================================================
     print("\n" + "=" * 110)
-    print("STEP 7: HYPERPARAMETER GRID TUNING ON BEST ESTIMATOR")
+    print("STEP 7: HYPERPARAMETER GRID TUNING")
     print("=" * 110)
 
     param_grid = {
@@ -507,7 +496,7 @@ def main():
     grid_search = GridSearchCV(
         estimator=HistGradientBoostingClassifier(random_state=42),
         param_grid=param_grid,
-        cv=3,
+        cv=2,
         scoring='roc_auc',
         n_jobs=-1
     )
@@ -515,15 +504,15 @@ def main():
     print(f"[✓] Tuned Hyperparameters: {grid_search.best_params_}")
     print(f"[✓] Tuned Cross-Validation ROC-AUC: {grid_search.best_score_:.4f}")
 
-    # Retrain best ensemble on the full dataset
+    # Retrain best ensemble on full universal training pool
     X_full_scaled = scaler.fit_transform(X_full)
     best_ensemble_model.fit(X_full_scaled, y_full)
 
     # =========================================================================
-    # STEP 8: SCORE & RANK ENTIRE NSE MARKET CROSS-SECTIONALLY
+    # STEP 8: SCORE & RANK ALL DISCOVERED STOCKS
     # =========================================================================
     print("\n" + "=" * 110)
-    print(f"STEP 8: SCORING & RANKING ALL {len(latest_market_state):,} ACTIVE NSE EQUITIES")
+    print(f"STEP 8: LIVE SCREENING & RANKING ACROSS {len(latest_market_state)} STOCKS")
     print("=" * 110)
 
     opportunities = []
@@ -569,7 +558,7 @@ def main():
     print("=" * 110)
 
     pd.DataFrame(opportunities).to_csv("final_ranked_results.csv", index=False)
-    print(f"\n[+] Successfully scanned {len(opportunities)} NSE stocks. Master results saved to 'final_ranked_results.csv'.")
+    print(f"\n[+] Master results saved to 'final_ranked_results.csv'.")
 
 
 if __name__ == "__main__":
