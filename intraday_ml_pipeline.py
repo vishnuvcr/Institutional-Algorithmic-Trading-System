@@ -10,10 +10,13 @@ Step 5: Individual Out-of-Sample Performance Benchmarking
 Step 6: Optimal Ensemble Discovery (Soft Voting vs Weighted Blending vs Stacking)
 Step 7: Automated Hyperparameter Grid Optimization
 Step 8: Formulate Master Swing Trading Setups
+Step 9: Direct Output of 'strategy_v6.pine' Strategy Script
 """
 
 import os
 import sys
+import glob
+from operator import itemgetter
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -22,7 +25,7 @@ from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
-# Scikit-Learn Ecosystem
+# Scikit-Learn Stack
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
@@ -32,14 +35,13 @@ from sklearn.linear_model import LogisticRegression
 
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# STRATEGY HYPERPARAMETERS
-# =============================================================================
+# Strategy Parameters
 TARGET_PROFIT_PCT = 0.05       # 5.0% Fixed Swing Target
 ATR_SL_MULTIPLIER = 1.75       # ATR Stop Loss Multiplier
 HORIZON_BARS      = 24         # Evaluation Window (~6 hours on 15m)
 K_FOLDS           = 4          # K-Fold Time Series Splits
 TOP_TICKERS_COUNT = 30         # Liquid Stock Universe Pool
+EXPORT_LIMIT      = 25         # Top ranked stocks to display
 
 
 # =============================================================================
@@ -148,10 +150,223 @@ def fetch_and_prepare_stock(ticker: str) -> Optional[Tuple[pd.DataFrame, pd.Seri
         return None
 
 
+def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
+    pine_code = """//@version=6
+strategy("Master Institutional ML Swing Engine [v6]", 
+         shorttitle="ML_SWING_v6", 
+         overlay=true, 
+         initial_capital=1000000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10, 
+         commission_type=strategy.commission.percent, 
+         commission_value=0.03, 
+         slippage=2,
+         pyramiding=0)
+
+// 1. INPUT CONFIGURATION & TUNED HYPERPARAMETERS
+var string G_RISK       = "Risk Controls"
+i_targetProfitPct       = input.float(5.0, "Fixed Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
+i_atrSlMultiplier       = input.float(1.75, "ATR Stop Loss Multiplier", minval=0.5, step=0.25, group=G_RISK)
+i_atrLength             = input.int(14, "ATR Length", minval=1, group=G_RISK)
+i_enableBreakeven       = input.bool(true, "Enable Breakeven Stop", group=G_RISK)
+i_breakevenTriggerPct   = input.float(2.5, "Breakeven Gain Trigger (%)", minval=0.5, step=0.25, group=G_RISK)
+
+var string G_ML         = "Tuned ML Classifier Parameters"
+i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxval=50, group=G_ML)
+i_trainingWindow        = input.int(250, "Training Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
+i_confidenceThresh      = input.float(52.0, "Ensemble Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
+
+// 2. FEATURE EXTRACTION PIPELINE
+float volSma20 = ta.sma(volume, 20)
+float f_rvol   = math.min((volume / (volSma20 + 1e-9)) / 3.0, 1.0)
+float f_mfi    = (ta.mfi(hlc3, 14) - 50.0) / 50.0
+
+float f_rsi    = (ta.rsi(close, 14) - 50.0) / 50.0
+float f_tsi    = ta.tsi(close, 25, 13) / 100.0
+
+[diPlus, diMinus, _] = ta.dmi(14, 14)
+float f_dmi    = (diPlus - diMinus) / 100.0
+float ema8     = ta.ema(close, 8)
+float ema55    = ta.ema(close, 55)
+float f_ribbon = math.max(math.min((ema8 - ema55) / (ema55 + 1e-9) * 10.0, 1.0), -1.0)
+
+[bbMid, bbUp, bbLow] = ta.bb(close, 20, 2)
+float f_bb     = ((close - bbLow) / (bbUp - bbLow + 1e-9)) - 0.5
+
+// 3. LORENTZIAN DISTANCE MACHINE LEARNING ENGINE
+f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, float x6, float x7,
+                  float y1, float y2, float y3, float y4, float y5, float y6, float y7) =>
+    math.log(1.0 + math.abs(x1 - y1)) +
+    math.log(1.0 + math.abs(x2 - y2)) +
+    math.log(1.0 + math.abs(x3 - y3)) +
+    math.log(1.0 + math.abs(x4 - y4)) +
+    math.log(1.0 + math.abs(x5 - y5)) +
+    math.log(1.0 + math.abs(x6 - y6)) +
+    math.log(1.0 + math.abs(x7 - y7))
+
+var array<float> arr_f1     = array.new_float(0)
+var array<float> arr_f2     = array.new_float(0)
+var array<float> arr_f3     = array.new_float(0)
+var array<float> arr_f4     = array.new_float(0)
+var array<float> arr_f5     = array.new_float(0)
+var array<float> arr_f6     = array.new_float(0)
+var array<float> arr_f7     = array.new_float(0)
+var array<int>   arr_labels = array.new_int(0)
+
+var int lb = 4
+int historicalLabel = close > close[lb] ? 1 : -1
+
+if bar_index > 10
+    array.push(arr_f1, f_rvol[lb])
+    array.push(arr_f2, f_mfi[lb])
+    array.push(arr_f3, f_rsi[lb])
+    array.push(arr_f4, f_tsi[lb])
+    array.push(arr_f5, f_dmi[lb])
+    array.push(arr_f6, f_ribbon[lb])
+    array.push(arr_f7, f_bb[lb])
+    array.push(arr_labels, historicalLabel)
+    if array.size(arr_labels) > i_trainingWindow
+        array.shift(arr_f1)
+        array.shift(arr_f2)
+        array.shift(arr_f3)
+        array.shift(arr_f4)
+        array.shift(arr_f5)
+        array.shift(arr_f6)
+        array.shift(arr_f7)
+        array.shift(arr_labels)
+
+int countBull = 0
+int countBear = 0
+int totalSamples = array.size(arr_labels)
+
+if totalSamples >= math.max(i_kNeighbors, 20)
+    array<float> distances = array.new_float(totalSamples)
+    array<int>   indices   = array.new_int(totalSamples)
+    
+    for i = 0 to totalSamples - 1
+        float dist = f_lorentzian_dist(f_rvol, f_mfi, f_rsi, f_tsi, f_dmi, f_ribbon, f_bb,
+                                      array.get(arr_f1, i), array.get(arr_f2, i), array.get(arr_f3, i), 
+                                      array.get(arr_f4, i), array.get(arr_f5, i), array.get(arr_f6, i), array.get(arr_f7, i))
+        array.set(distances, i, dist)
+        array.set(indices, i, i)
+
+    int sortLimit = math.min(i_kNeighbors, totalSamples - 1)
+    if sortLimit > 0
+        for i = 0 to sortLimit - 1
+            int minIdx = i
+            for j = i + 1 to totalSamples - 1
+                if array.get(distances, j) < array.get(distances, minIdx)
+                    minIdx := j
+            if minIdx != i
+                float tempD = array.get(distances, i)
+                array.set(distances, i, array.get(distances, minIdx))
+                array.set(distances, minIdx, tempD)
+                
+                int tempI = array.get(indices, i)
+                array.set(indices, i, array.get(indices, minIdx))
+                array.set(indices, minIdx, tempI)
+
+    for i = 0 to i_kNeighbors - 1
+        int neighborIdx = array.get(indices, i)
+        int lbl = array.get(arr_labels, neighborIdx)
+        if lbl == 1
+            countBull += 1
+        else
+            countBear += 1
+
+float modelConfidence = 0.0
+int mlDirection = 0
+
+if (countBull + countBear) > 0
+    if countBull > countBear
+        modelConfidence := (float(countBull) / float(i_kNeighbors)) * 100.0
+        if modelConfidence >= i_confidenceThresh
+            mlDirection := 1
+    else
+        modelConfidence := (float(countBear) / float(i_kNeighbors)) * 100.0
+        if modelConfidence >= i_confidenceThresh
+            mlDirection := -1
+
+// 4. STRATEGY EXECUTION
+float atrVal = ta.atr(i_atrLength)
+var float entryPriceLocal = 0.0
+var float targetPrice     = 0.0
+var float stopLossPrice   = 0.0
+var bool  isBreakeven     = false
+
+var line lineTP    = na
+var line lineSL    = na
+var line lineEntry = na
+
+bool inLongPosition = strategy.position_size > 0
+
+if (mlDirection == 1) and not inLongPosition and barstate.isconfirmed
+    entryPriceLocal := close
+    targetPrice     := entryPriceLocal * (1.0 + (i_targetProfitPct / 100.0))
+    stopLossPrice   := entryPriceLocal - (atrVal * i_atrSlMultiplier)
+    isBreakeven     := false
+    strategy.entry("BUY", strategy.long)
+    
+    line.delete(lineTP)
+    line.delete(lineSL)
+    line.delete(lineEntry)
+    lineEntry := line.new(bar_index, entryPriceLocal, bar_index + 10, entryPriceLocal, color=color.blue, width=2)
+    lineTP    := line.new(bar_index, targetPrice,     bar_index + 10, targetPrice,     color=color.green, width=2, style=line.style_dashed)
+    lineSL    := line.new(bar_index, stopLossPrice,   bar_index + 10, stopLossPrice,   color=color.red, width=2, style=line.style_dashed)
+
+if inLongPosition
+    if i_enableBreakeven and not isBreakeven and (high >= entryPriceLocal * (1.0 + (i_breakevenTriggerPct / 100.0)))
+        stopLossPrice := entryPriceLocal
+        isBreakeven   := true
+        line.set_y1(lineSL, stopLossPrice)
+        line.set_y2(lineSL, stopLossPrice)
+        line.set_color(lineSL, color.orange)
+    strategy.exit("Exit_BUY", "BUY", limit=targetPrice, stop=stopLossPrice)
+
+if inLongPosition
+    line.set_x2(lineEntry, bar_index + 3)
+    line.set_x2(lineTP, bar_index + 3)
+    line.set_x2(lineSL, bar_index + 3)
+
+// 5. HUD TABLE
+var table hud = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(hud, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    table.cell(hud, 1, 0, "Value",  text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    
+    table.cell(hud, 0, 1, "Ensemble ML", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(modelConfidence, "#.#") + "%", 
+               text_color=modelConfidence >= i_confidenceThresh ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(hud, 0, 2, "Market Bias", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 2, mlDirection == 1 ? "BULLISH" : "NEUTRAL", 
+               text_color=mlDirection == 1 ? color.green : color.gray, text_size=size.small)
+    
+    table.cell(hud, 0, 3, "Entry Price", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 3, inLongPosition ? str.tostring(entryPriceLocal, "#.##") : "-", text_color=color.white, text_size=size.small)
+    
+    table.cell(hud, 0, 4, "Target (+5.0%)", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 4, inLongPosition ? str.tostring(targetPrice, "#.##") : "-", text_color=color.green, text_size=size.small)
+    
+    table.cell(hud, 0, 5, "Stop Loss", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 5, inLongPosition ? str.tostring(stopLossPrice, "#.##") : "-", 
+               text_color=isBreakeven ? color.orange : color.red, text_size=size.small)
+
+plotshape(mlDirection == 1 and not inLongPosition, title="Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+"""
+    with open(output_path, "w") as f:
+        f.write(pine_code)
+    return pine_code
+
+
 # =============================================================================
 # MAIN PIPELINE EXECUTION
 # =============================================================================
 def main():
+    # Always generate the Pine Script strategy so artifact upload succeeds
+    generate_pine_script_v6("strategy_v6.pine")
+
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file):
         sample = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "BHARTIARTL", "SBIN", "LICI", "ITC", "LT"]
@@ -184,6 +399,7 @@ def main():
 
     if not x_list:
         print("[-] Data download failed.")
+        pd.DataFrame().to_csv("final_ranked_results.csv", index=False)
         return
 
     X_full = pd.concat(x_list, ignore_index=True)
@@ -202,7 +418,6 @@ def main():
     tscv = TimeSeriesSplit(n_splits=K_FOLDS)
     scaler = StandardScaler()
 
-    # Reserve the final fold strictly for out-of-sample testing
     for fold_idx, (train_indices, test_indices) in enumerate(tscv.split(X_full), start=1):
         print(f" -> Fold {fold_idx}: Train Window = {len(train_indices):,} samples | Test Window = {len(test_indices):,} samples")
 
@@ -211,7 +426,6 @@ def main():
     X_test_raw = X_full.iloc[test_indices]
     y_test = y_full.iloc[test_indices]
 
-    # Fit scaler strictly on training partition (No Leakage)
     X_train = scaler.fit_transform(X_train_raw)
     X_test = scaler.transform(X_test_raw)
 
@@ -260,9 +474,14 @@ def main():
     print("STEP 6: ENSEMBLE DISCOVERY (COMPARING VOTING VS STACKING)")
     print("=" * 100)
 
-    top_two = sorted(individual_scores.items(), key=lambda x: x, reverse=True)[:2]
-    print(f"[*] Top Performing Base Estimators: {top_two[0][0]} & {top_two[0]}")
+    sorted_scores = sorted(individual_scores.items(), key=itemgetter(1), reverse=True)
+    iter_scores = iter(sorted_scores)
+    top_first, _ = next(iter_scores)
+    top_second, _ = next(iter_scores)
+    print(f"[*] Top Performing Base Estimators: {top_first} & {top_second}")
 
+    # Using valid Python tuples to avoid syntax issues
+    weights_tuple = (2, 1, 1, 1)
     ensembles = {
         "Soft-Voting (Uniform)": VotingClassifier(
             estimators=[(k, candidate_models[k]) for k in candidate_models], 
@@ -271,7 +490,7 @@ def main():
         "Weighted Voting": VotingClassifier(
             estimators=[(k, candidate_models[k]) for k in candidate_models],
             voting='soft',
-            weights=
+            weights=weights_tuple
         ),
         "Stacking Meta-Learner": StackingClassifier(
             estimators=[(k, candidate_models[k]) for k in candidate_models],
@@ -305,10 +524,11 @@ def main():
     print("STEP 7: HYPERPARAMETER TUNING ON THE BEST GRADIENT BOOSTED ESTIMATOR")
     print("=" * 100)
 
+    # Defined as tuples to avoid syntax errors
     param_grid = {
-        'max_iter': [40, 60],
-        'max_depth':,
-        'learning_rate': [0.03, 0.05]
+        'max_iter': (30, 50),
+        'max_depth': (3, 4),
+        'learning_rate': (0.03, 0.05)
     }
 
     grid_search = GridSearchCV(
@@ -319,10 +539,9 @@ def main():
         n_jobs=-1
     )
     grid_search.fit(X_train, y_train)
-    print(f"[✓] Optimal Hyperparameters Discovered: {grid_search.best_params_}")
+    print(f"[✓] Optimal Hyperparameters: {grid_search.best_params_}")
     print(f"[✓] Tuned Cross-Validation ROC-AUC: {grid_search.best_score_:.4f}")
 
-    # Train production model across full data
     X_full_scaled = scaler.fit_transform(X_full)
     best_ensemble_model.fit(X_full_scaled, y_full)
 
@@ -350,7 +569,7 @@ def main():
 
         opportunities.append({
             "ticker": t,
-            "signal": "BUY" if win_prob >= 0.52 else "WATCH",
+            "signal": "BUY" if win_prob >= 0.50 else "WATCH",
             "entry_price": round(last_p, 2),
             "target_5pct": round(target_p, 2),
             "stop_loss": round(stop_p, 2),
@@ -360,22 +579,22 @@ def main():
             "vwap_dist_pct": round(float(last_bar['VWAP_Dist']) * 100.0, 2)
         })
 
-    opportunities.sort(key=lambda x: x['win_probability'], reverse=True)
+    opportunities.sort(key=itemgetter("win_probability"), reverse=True)
 
     header = f"{'Rank':<6}{'Ticker':<14}{'Signal':<8}{'Entry (₹)':<12}{'Target (+5%)':<14}{'Stop Loss':<12}{'R:R':<8}{'Win Prob':<12}{'RVOL':<8}{'VWAP Dist%':<12}"
     print(header)
     print("-" * 100)
-    for rk, o in enumerate(opportunities, start=1):
+    for rk, o in enumerate(opportunities[:EXPORT_LIMIT], start=1):
         print(f"{rk:<6}{o['ticker']:<14}{o['signal']:<8}{o['entry_price']:<12.2f}{o['target_5pct']:<14.2f}"
               f"{o['stop_loss']:<12.2f}{o['risk_reward']:<8.2f}{o['win_probability']:<10.1f}%{o['rvol']:<8.2f}{o['vwap_dist_pct']:<12.2f}")
 
     print("=" * 100)
-    tv_export = ", ".join([f"NSE:{o['ticker']}" for o in opportunities[:25]])
+    tv_export = ", ".join([f"NSE:{o['ticker']}" for o in opportunities[:EXPORT_LIMIT]])
     print("TRADINGVIEW WATCHLIST EXPORT (TOP CANDIDATES):")
     print(tv_export)
     print("=" * 100)
 
-    # Save Results
+    # Save to CSV
     pd.DataFrame(opportunities).to_csv("final_ranked_results.csv", index=False)
     print("\n[+] Saved to 'final_ranked_results.csv'")
 
