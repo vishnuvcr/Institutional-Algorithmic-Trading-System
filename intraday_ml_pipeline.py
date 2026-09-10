@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-UNIVERSAL QUANTITATIVE ML ENGINE FOR INDIAN EQUITIES (NSE)
-==========================================================
-- Architecture: Pooled Cross-Sectional Machine Learning
-- Dataset: All NSE Equities Combined into a Single Universal Feature Matrix
-- Features: Dimensionless Causal Ratios (Cross-Asset Stationary)
-- Model: Single Universal Voting Ensemble (GBM + k-NN + Regularized Logistic)
-- Execution: Cross-Sectional Ranking & Pine Script v6 Integration
+INSTITUTIONAL UNIVERSAL QUANT ML ENGINE (NSE)
+==============================================
+Includes Full Feature Store:
+- Volume: Relative Volume (RVOL), Normalized OBV, VWAP Distance, Money Flow Index (MFI)
+- Momentum: Normalized RSI, Stochastic %K/%D, True Strength Index (TSI), ROC
+- Trend: Supertrend Distance, ADX, Directional Differential (DMI), Multi-EMA Ribbons
+- Volatility: Historical Volatility (HV), Normalized ATR (NATR), Bollinger Bands (%B)
 """
 
 import os
@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
@@ -23,17 +23,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import HistGradientBoostingClassifier, VotingClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore")
 
-# Universal Strategy Parameters
-TARGET_PROFIT_PCT = 0.025       # 2.5% Target (Intraday Horizon)
-ATR_MULTIPLIER    = 1.50        # Volatility Stop Loss Multiplier
-HORIZON_BARS      = 20          # Max forward bars (~5 hours of trading)
-MIN_BARS_PER_STOCK= 150         # Minimum bars required to include stock in pool
-MAX_POOL_STOCKS   = 60          # Number of liquid stocks to train the universal brain
-RISK_FREE_RATE    = 0.065       # Baseline rate (~6.5%)
+# Strategy Parameters
+TARGET_PROFIT_PCT  = 0.025      # 2.5% Target (Intraday Horizon)
+ATR_MULTIPLIER     = 1.50       # ATR Stop Loss Multiplier
+HORIZON_BARS       = 20         # Forward evaluation bars (~5 hours on 15m)
+MIN_BARS_PER_STOCK = 150        # Minimum bars required
+MAX_POOL_STOCKS    = 60         # Top liquid stocks pooled for training
+RISK_FREE_RATE     = 0.065      # Baseline rate (~6.5%)
 
 
 @dataclass
@@ -45,24 +44,49 @@ class UniversalOpportunity:
     stop_loss: float
     risk_reward: float
     universal_prob: float
+    rvol: float
+    vwap_dist: float
     atr: float
 
 
 # =============================================================================
-# 1. DIMENSIONLESS CAUSAL FEATURE STORE (UNIVERSAL SCALE)
+# 1. FULL INSTITUTIONAL FEATURE STORE (VOLUME + MOMENTUM + TREND + VOLATILITY)
 # =============================================================================
-def build_dimensionless_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Computes pure dimensionless indicators. Regardless of whether a stock is
-    trading at Rs. 100 or Rs. 3,000, these features inhabit the exact same range.
-    """
+def build_full_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
     close = data['Close']
     high = data['High']
     low = data['Low']
     volume = data['Volume']
 
-    # 1. RSI (Scaled to -1.0 to +1.0)
+    # ------------------ A. VOLUME DYNAMICS ------------------
+    # 1. RVOL (Relative Volume Surge vs 20-period average)
+    vol_sma20 = volume.rolling(20).mean()
+    data['RVOL'] = volume / (vol_sma20 + 1e-9)
+
+    # 2. Intraday Anchored VWAP Distance (%)
+    typical_p = (high + low + close) / 3.0
+    cum_pv = (typical_p * volume).cumsum()
+    cum_v = volume.cumsum()
+    vwap = cum_pv / (cum_v + 1e-9)
+    data['VWAP_Dist'] = (close - vwap) / (vwap + 1e-9)
+
+    # 3. Normalized On-Balance Volume (OBV 20-bar Z-Score)
+    direction_sign = np.sign(close.diff()).fillna(0)
+    obv = (direction_sign * volume).cumsum()
+    obv_mean = obv.rolling(20).mean()
+    obv_std = obv.rolling(20).std(ddof=1)
+    data['OBV_Z'] = (obv - obv_mean) / (obv_std + 1e-9)
+
+    # 4. Money Flow Index (MFI 14 normalized to)
+    rmf = typical_p * volume
+    pos_flow = pd.Series(np.where(typical_p > typical_p.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
+    neg_flow = pd.Series(np.where(typical_p < typical_p.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
+    mfi_raw = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
+    data['MFI_Norm'] = (mfi_raw - 50.0) / 50.0
+
+    # ------------------ B. MOMENTUM METRICS ------------------
+    # 5. Normalized RSI (14)
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, min_periods=14).mean()
@@ -70,50 +94,70 @@ def build_dimensionless_features(df: pd.DataFrame) -> pd.DataFrame:
     rsi_raw = 100.0 - (100.0 / (1.0 + rs))
     data['RSI_Norm'] = (rsi_raw - 50.0) / 50.0
 
-    # 2. Stochastic %K (Scaled to -1.0 to +1.0)
+    # 6. Stochastic Oscillator %K & %D (14, 3)
     low_14 = low.rolling(14).min()
     high_14 = high.rolling(14).max()
     stoch_k = 100.0 * ((close - low_14) / (high_14 - low_14 + 1e-9))
     data['Stoch_Norm'] = (stoch_k - 50.0) / 50.0
 
-    # 3. Volatility: Normalized ATR (Percentage of Price)
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    data['ATR'] = tr.ewm(alpha=1/14, min_periods=14).mean()
-    data['NATR'] = (data['ATR'] / close) * 100.0
+    # 7. True Strength Index (TSI 25, 13 normalized to)
+    diff = close.diff()
+    smooth1 = diff.ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    abs_smooth1 = diff.abs().ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    data['TSI_Norm'] = smooth1 / (abs_smooth1 + 1e-9)
 
-    # 4. Bollinger Band Position (%B centered at 0)
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std(ddof=1)
-    bb_up = bb_mid + 2.0 * bb_std
-    bb_low = bb_mid - 2.0 * bb_std
-    data['BB_Norm'] = ((close - bb_low) / (bb_up - bb_low + 1e-9)) - 0.5
+    # 8. Short-Term Price Return (ROC 4)
+    data['ROC_4'] = close.pct_change(4)
 
-    # 5. Money Flow Index (Scaled to -1.0 to +1.0)
-    tp = (high + low + close) / 3.0
-    rmf = tp * volume
-    pos_flow = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
-    neg_flow = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
-    mfi_raw = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
-    data['MFI_Norm'] = (mfi_raw - 50.0) / 50.0
-
-    # 6. Trend Ribbon Spread (Percentage difference)
+    # ------------------ C. TREND METRICS ------------------
+    # 9. EMA Ribbon Spread (8 vs 55 EMA)
     ema8 = close.ewm(span=8, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema55 = close.ewm(span=55, adjust=False).mean()
     data['Ribbon_Spread'] = (ema8 - ema55) / (ema55 + 1e-9)
     data['Fast_Spread'] = (ema8 - ema21) / (ema21 + 1e-9)
 
-    # 7. Short-Term Return
-    data['ROC_4'] = close.pct_change(4)
+    # 10. Directional Movement Index (ADX 14 & DI Differential)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr_s = tr.ewm(alpha=1/14, min_periods=14).mean()
+
+    up_m = high - high.shift(1)
+    down_m = low.shift(1) - low
+    p_dm = np.where((up_m > down_m) & (up_m > 0), up_m, 0.0)
+    m_dm = np.where((down_m > up_m) & (down_m > 0), down_m, 0.0)
+    p_di = 100.0 * pd.Series(p_dm, index=data.index).ewm(alpha=1/14, min_periods=14).mean() / (tr_s + 1e-9)
+    m_di = 100.0 * pd.Series(m_dm, index=data.index).ewm(alpha=1/14, min_periods=14).mean() / (tr_s + 1e-9)
+    dx = 100.0 * (p_di - m_di).abs() / (p_di + m_di + 1e-9)
+    data['ADX_Norm'] = dx.ewm(alpha=1/14, min_periods=14).mean() / 100.0
+    data['DMI_Diff'] = (p_di - m_di) / 100.0
+
+    # 11. Supertrend Distance (%)
+    data['ATR'] = tr_s
+    data['NATR'] = (data['ATR'] / close) * 100.0
+    st_basic_ub = (high + low) / 2.0 + (3.0 * tr_s)
+    st_basic_lb = (high + low) / 2.0 - (3.0 * tr_s)
+    data['Supertrend_Dist'] = (close - st_basic_lb) / close
+
+    # ------------------ D. VOLATILITY METRICS ------------------
+    # 12. Bollinger Bands (%B normalized)
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std(ddof=1)
+    bb_up = bb_mid + 2.0 * bb_std
+    bb_low = bb_mid - 2.0 * bb_std
+    data['BB_Norm'] = ((close - bb_low) / (bb_up - bb_low + 1e-9)) - 0.5
+
+    # 13. Historical Volatility (Annualized log returns)
+    log_ret = np.log(close / close.shift(1))
+    data['Hist_Vol'] = log_ret.rolling(20).std() * np.sqrt(252 * 25)
 
     return data
 
 
 # =============================================================================
-# 2. UNIVERSAL TRIPLE-BARRIER LABELING
+# 2. TRIPLE-BARRIER LABELING
 # =============================================================================
 def generate_universal_labels(df: pd.DataFrame) -> pd.Series:
     close = df['Close'].values
@@ -142,20 +186,16 @@ def generate_universal_labels(df: pd.DataFrame) -> pd.Series:
 
 
 # =============================================================================
-# 3. TRAIN THE SINGLE UNIVERSAL ENSEMBLE
+# 3. UNIVERSAL ENSEMBLE CLASSIFIER
 # =============================================================================
 def build_universal_ensemble() -> VotingClassifier:
     clf_gbm = HistGradientBoostingClassifier(max_iter=60, max_depth=4, learning_rate=0.05, random_state=42)
     clf_knn = KNeighborsClassifier(n_neighbors=9, weights='distance', metric='manhattan')
-    clf_lr  = LogisticRegression(C=0.1, max_iter=300, random_state=42)
+    clf_lr  = LogisticRegression(C=0.1, max_iter=400, random_state=42)
     return VotingClassifier(estimators=[('gbm', clf_gbm), ('knn', clf_knn), ('lr', clf_lr)], voting='soft')
 
 
 def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
-    """
-    Generates the matching Universal Pine Script v6 Strategy.
-    Because features are normalized, the exact same script runs on ANY chart.
-    """
     pine_code = """//@version=6
 strategy("Universal Quantitative ML Engine [v6]", 
          shorttitle="UNIV_ML_v6", 
@@ -168,77 +208,82 @@ strategy("Universal Quantitative ML Engine [v6]",
          slippage=2,
          pyramiding=0)
 
-// 1. UNIVERSAL CONFIGURATION
-var string G_MODE       = "Universal Operational Mode"
-i_tradeMode             = input.string("Intraday (15m)", "Trading Mode", options=["Scalping (1m-5m)", "Intraday (15m)", "Swing (Daily)", "BTST (EOD)"], group=G_MODE)
+// 1. CONFIGURATION
+var string G_MODE       = "Universal Trading Mode"
+i_tradeMode             = input.string("Intraday (15m)", "Mode", options=["Scalping (1m-5m)", "Intraday (15m)", "Swing (Daily)", "BTST (EOD)"], group=G_MODE)
 i_enableShorts          = input.bool(true, "Enable Short Trades", group=G_MODE)
 
 var string G_RISK       = "Universal Risk Controls"
-i_targetProfitPct       = input.float(2.0, "Take Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
+i_targetProfitPct       = input.float(2.5, "Take Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
 i_atrSlMultiplier       = input.float(1.50, "ATR Stop Loss Multiplier", minval=0.5, step=0.25, group=G_RISK)
 i_atrLength             = input.int(14, "ATR Length", minval=1, group=G_RISK)
 i_enableBreakeven       = input.bool(true, "Enable Breakeven Ratchet", group=G_RISK)
-i_breakevenTriggerPct   = input.float(1.2, "Breakeven Activation Gain (%)", minval=0.5, step=0.25, group=G_RISK)
+i_breakevenTriggerPct   = input.float(1.2, "Breakeven Gain (%)", minval=0.5, step=0.25, group=G_RISK)
 
-var string G_ML         = "Universal Lorentzian Classifier"
+var string G_ML         = "Universal Lorentzian Parameters"
 i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxval=50, group=G_ML)
 i_trainingWindow        = input.int(250, "Training Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
 i_confidenceThresh      = input.float(52.0, "Model Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
 
-// 2. UNIVERSAL FEATURE NORMALIZATION
-f_calc_rsi(int len) =>
-    float rawRsi = ta.rsi(close, len)
-    (rawRsi - 50.0) / 50.0
+// 2. FEATURE EXTRACTION PIPELINE (VOLUME + MOMENTUM + TREND + VOLATILITY)
+// Volume: RVOL & MFI
+float volSma20 = ta.sma(volume, 20)
+float rvol = volume / (volSma20 + 1e-9)
+float f_rvol = math.min(rvol / 3.0, 1.0) // Normalized 0 to 1
 
-f_calc_cci(int len) =>
-    float rawCci = ta.cci(close, len)
-    math.max(math.min(rawCci / 200.0, 1.0), -1.0)
+float rawMfi = ta.mfi(hlc3, 14)
+float f_mfi = (rawMfi - 50.0) / 50.0 // Normalized -1 to 1
 
-f_calc_tsi(int longLen, int shortLen) =>
-    float rawTsi = ta.tsi(close, longLen, shortLen)
-    rawTsi / 100.0
+// Momentum: RSI & TSI
+float rawRsi = ta.rsi(close, 14)
+float f_rsi = (rawRsi - 50.0) / 50.0
 
-f_calc_mfi(int len) =>
-    float rawMfi = ta.mfi(hlc3, len)
-    (rawMfi - 50.0) / 50.0
+float rawTsi = ta.tsi(close, 25, 13)
+float f_tsi = rawTsi / 100.0
 
-f_calc_adx_diff(int len) =>
-    [diPlus, diMinus, adxVal] = ta.dmi(len, len)
-    float diff = (diPlus - diMinus) / 100.0
-    math.max(math.min(diff, 1.0), -1.0)
+// Trend: ADX & EMA Ribbon
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+float f_dmi = (diPlus - diMinus) / 100.0
 
-f1 = f_calc_rsi(14)
-f2 = f_calc_cci(20)
-f3 = f_calc_tsi(25, 13)
-f4 = f_calc_mfi(14)
-f5 = f_calc_adx_diff(14)
+float ema8 = ta.ema(close, 8)
+float ema55 = ta.ema(close, 55)
+float f_ribbon = math.max(math.min((ema8 - ema55) / (ema55 + 1e-9) * 10.0, 1.0), -1.0)
+
+// Volatility: Bollinger %B
+[bbMid, bbUp, bbLow] = ta.bb(close, 20, 2)
+float f_bb = ((close - bbLow) / (bbUp - bbLow + 1e-9)) - 0.5
 
 // 3. LORENTZIAN DISTANCE METRIC
-f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, 
-                  float y1, float y2, float y3, float y4, float y5) =>
-    float d1 = math.log(1.0 + math.abs(x1 - y1))
-    float d2 = math.log(1.0 + math.abs(x2 - y2))
-    float d3 = math.log(1.0 + math.abs(x3 - y3))
-    float d4 = math.log(1.0 + math.abs(x4 - y4))
-    float d5 = math.log(1.0 + math.abs(x5 - y5))
-    d1 + d2 + d3 + d4 + d5
+f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, float x6, float x7,
+                  float y1, float y2, float y3, float y4, float y5, float y6, float y7) =>
+    math.log(1.0 + math.abs(x1 - y1)) +
+    math.log(1.0 + math.abs(x2 - y2)) +
+    math.log(1.0 + math.abs(x3 - y3)) +
+    math.log(1.0 + math.abs(x4 - y4)) +
+    math.log(1.0 + math.abs(x5 - y5)) +
+    math.log(1.0 + math.abs(x6 - y6)) +
+    math.log(1.0 + math.abs(x7 - y7))
 
 var array<float> arr_f1     = array.new_float(0)
 var array<float> arr_f2     = array.new_float(0)
 var array<float> arr_f3     = array.new_float(0)
 var array<float> arr_f4     = array.new_float(0)
 var array<float> arr_f5     = array.new_float(0)
+var array<float> arr_f6     = array.new_float(0)
+var array<float> arr_f7     = array.new_float(0)
 var array<int>   arr_labels = array.new_int(0)
 
 var int lb = 4
 int historicalLabel = close > close[lb] ? 1 : -1
 
 if bar_index > 10
-    array.push(arr_f1, f1[lb])
-    array.push(arr_f2, f2[lb])
-    array.push(arr_f3, f3[lb])
-    array.push(arr_f4, f4[lb])
-    array.push(arr_f5, f5[lb])
+    array.push(arr_f1, f_rvol[lb])
+    array.push(arr_f2, f_mfi[lb])
+    array.push(arr_f3, f_rsi[lb])
+    array.push(arr_f4, f_tsi[lb])
+    array.push(arr_f5, f_dmi[lb])
+    array.push(arr_f6, f_ribbon[lb])
+    array.push(arr_f7, f_bb[lb])
     array.push(arr_labels, historicalLabel)
     if array.size(arr_labels) > i_trainingWindow
         array.shift(arr_f1)
@@ -246,6 +291,8 @@ if bar_index > 10
         array.shift(arr_f3)
         array.shift(arr_f4)
         array.shift(arr_f5)
+        array.shift(arr_f6)
+        array.shift(arr_f7)
         array.shift(arr_labels)
 
 int countBull = 0
@@ -257,12 +304,14 @@ if totalSamples >= math.max(i_kNeighbors, 20)
     array<int>   indices   = array.new_int(totalSamples)
     
     for i = 0 to totalSamples - 1
-        float dist = f_lorentzian_dist(f1, f2, f3, f4, f5, 
+        float dist = f_lorentzian_dist(f_rvol, f_mfi, f_rsi, f_tsi, f_dmi, f_ribbon, f_bb,
                                       array.get(arr_f1, i), 
                                       array.get(arr_f2, i), 
                                       array.get(arr_f3, i), 
                                       array.get(arr_f4, i), 
-                                      array.get(arr_f5, i))
+                                      array.get(arr_f5, i),
+                                      array.get(arr_f6, i),
+                                      array.get(arr_f7, i))
         array.set(distances, i, dist)
         array.set(indices, i, i)
 
@@ -411,7 +460,7 @@ plotshape(modeConditionSell and not inShortPosition, title="Sell Signal", style=
 
 
 # =============================================================================
-# 4. MASTER ORCHESTRATION: INGEST -> POOL -> TRAIN ONCE -> SCORE ALL
+# 4. UNIVERSAL ENGINE: POOL 60 STOCKS -> TRAIN ENSEMBLE -> SCORE ALL
 # =============================================================================
 def download_single_ticker(ticker: str) -> Optional[pd.DataFrame]:
     clean_t = ticker.strip().upper()
@@ -422,7 +471,7 @@ def download_single_ticker(ticker: str) -> Optional[pd.DataFrame]:
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df_feat = build_dimensionless_features(df).dropna()
+        df_feat = build_full_feature_store(df).dropna()
         if len(df_feat) < MIN_BARS_PER_STOCK:
             return None
         df_feat['TICKER'] = clean_t
@@ -446,11 +495,10 @@ def main():
     with open(ticker_file, "r") as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    # Select representative pool for universal training
     pool_tickers = all_tickers[:MAX_POOL_STOCKS]
 
     print("=" * 115)
-    print(f"UNIVERSAL ML ENGINE: INGESTING {len(pool_tickers)} LIQUID NSE EQUITIES INTO POOLED DATASET")
+    print(f"UNIVERSAL ML ENGINE: INGESTING {len(pool_tickers)} EQUITIES INTO COMPREHENSIVE FEATURE STORE")
     print("=" * 115)
 
     stock_dataframes: Dict[str, pd.DataFrame] = {}
@@ -461,17 +509,24 @@ def main():
             res = future.result()
             if res is not None:
                 stock_dataframes[t] = res
-                print(f"[+] Ingested {t:<12}: {len(res)} 15m bars")
+                print(f"[+] Ingested {t:<12}: {len(res)} 15m bars with Volume & VWAP")
+
+    # Unconditionally generate Pine Script v6 strategy
+    generate_pine_script_v6("strategy_v6.pine")
 
     if len(stock_dataframes) < 3:
-        print("[-] Insufficient data downloaded to construct universal model.")
-        generate_pine_script_v6("strategy_v6.pine")
+        print("[-] Insufficient data downloaded.")
         pd.DataFrame().to_csv("final_ranked_results.csv", index=False)
         return
 
-    # 1. POOL ALL HISTORICAL DATA ACROSS STOCKS
-    feature_cols = ['RSI_Norm', 'Stoch_Norm', 'NATR', 'BB_Norm', 'MFI_Norm', 'Ribbon_Spread', 'Fast_Spread', 'ROC_4']
-    
+    # Master Institutional Feature Vector
+    feature_cols = [
+        'RVOL', 'VWAP_Dist', 'OBV_Z', 'MFI_Norm', 
+        'RSI_Norm', 'Stoch_Norm', 'TSI_Norm', 'ROC_4', 
+        'Ribbon_Spread', 'Fast_Spread', 'ADX_Norm', 'DMI_Diff', 
+        'Supertrend_Dist', 'BB_Norm', 'NATR', 'Hist_Vol'
+    ]
+
     training_x_list = []
     training_y_list = []
     latest_rows = {}
@@ -480,33 +535,28 @@ def main():
         labels = generate_universal_labels(df_stock)
         valid_indices = df_stock.index[:-HORIZON_BARS]
         
-        X_stock = df_stock.loc[valid_indices, feature_cols]
-        y_stock = labels.loc[valid_indices]
-        
-        training_x_list.append(X_stock)
-        training_y_list.append(y_stock)
-        
-        # Save latest bar for live ranking
+        training_x_list.append(df_stock.loc[valid_indices, feature_cols])
+        training_y_list.append(labels.loc[valid_indices])
         latest_rows[t] = df_stock.iloc[[-1]]
 
     X_universal = pd.concat(training_x_list, ignore_index=True)
     y_universal = pd.concat(training_y_list, ignore_index=True)
 
     print("-" * 115)
-    print(f"[*] TOTAL UNIVERSAL TRAINING POOL: {len(X_universal):,} BARS ACROSS {len(stock_dataframes)} STOCKS")
-    print(f"[*] Class Distribution: Bullish Setups: {sum(y_universal == 1):,} | Other: {sum(y_universal == 0):,}")
-    print("[-] Training Single Universal Multi-Model Ensemble...")
+    print(f"[*] TOTAL POOLED TRAINING MATRIX: {len(X_universal):,} BARS × {len(feature_cols)} FEATURES")
+    print(f"[*] Bullish Targets (+2.5%): {sum(y_universal == 1):,} | Other/Stops: {sum(y_universal == 0):,}")
+    print("[-] Training Universal Multi-Model Ensemble...")
 
-    # 2. FIT THE SINGLE UNIVERSAL MODEL ON THE ENTIRE POOL
+    # Train Single Universal Scaler & Ensemble Model
     scaler = StandardScaler()
     X_universal_scaled = scaler.fit_transform(X_universal)
 
     universal_model = build_universal_ensemble()
     universal_model.fit(X_universal_scaled, y_universal)
-    print("[+] Universal Model Training Complete!")
+    print("[+] Universal Ensemble Trained Successfully!")
     print("-" * 115)
 
-    # 3. SCORE EVERY STOCK USING THE EXACT SAME UNIVERSAL BRAIN
+    # Score Every Stock with the Universal Model
     opportunities: List[UniversalOpportunity] = []
     row_first = 0
     col_win = 1
@@ -515,12 +565,14 @@ def main():
         feat_vals = row_df[feature_cols]
         feat_scaled = scaler.transform(feat_vals)
         
-        # Extract universal win probability
         probs = universal_model.predict_proba(feat_scaled)
         live_prob = float(probs[row_first, col_win])
 
         last_close = float(row_df['Close'].iloc[0])
         last_atr   = float(row_df['ATR'].iloc[0])
+        last_rvol  = float(row_df['RVOL'].iloc[0])
+        last_vwap  = float(row_df['VWAP_Dist'].iloc[0]) * 100.0
+
         target_p   = last_close * (1.0 + TARGET_PROFIT_PCT)
         stop_p     = last_close - (last_atr * ATR_MULTIPLIER)
         risk_r     = abs(target_p - last_close) / (abs(last_close - stop_p) + 1e-9)
@@ -533,38 +585,34 @@ def main():
             stop_loss=round(stop_p, 2),
             risk_reward=round(risk_r, 2),
             universal_prob=round(live_prob * 100.0, 1),
+            rvol=round(last_rvol, 2),
+            vwap_dist=round(last_vwap, 2),
             atr=round(last_atr, 2)
         )
         opportunities.append(opp)
 
-    # Sort cross-sectionally by Universal Probability
     opportunities.sort(key=lambda x: x.universal_prob, reverse=True)
 
-    # Save to CSV
     df_out = pd.DataFrame([asdict(o) for o in opportunities])
     df_out.to_csv("final_ranked_results.csv", index=False)
-    print("[+] Saved Master Cross-Sectional Ranking to 'final_ranked_results.csv'")
+    print("[+] Saved Universal Ranking to 'final_ranked_results.csv'")
 
-    # Print Master Ranked Table
-    print("\n" + "=" * 105)
-    print(f"{'MASTER CROSS-SECTIONAL UNIVERSAL ML RANKING (NSE 15m)':^105}")
-    print("=" * 105)
-    header = f"{'Rank':<6}{'Ticker':<14}{'Signal':<8}{'Entry (₹)':<12}{'Target (+2.5%)':<16}{'Stop Loss':<12}{'R:R':<8}{'Universal Prob':<16}{'ATR':<8}"
+    # Print Full Dashboard
+    print("\n" + "=" * 120)
+    print(f"{'MASTER CROSS-SECTIONAL UNIVERSAL ML RANKING (NSE 15m)':^120}")
+    print("=" * 120)
+    header = f"{'Rank':<6}{'Ticker':<14}{'Signal':<8}{'Entry (₹)':<12}{'Target (+2.5%)':<16}{'Stop Loss':<12}{'R:R':<8}{'ML Prob':<10}{'RVOL':<8}{'VWAP Dist%':<12}{'ATR':<8}"
     print(header)
-    print("-" * 105)
+    print("-" * 120)
     for rank, o in enumerate(opportunities, start=1):
         print(f"{rank:<6}{o.ticker:<14}{o.direction:<8}{o.entry_price:<12.2f}{o.target_price:<16.2f}"
-              f"{o.stop_loss:<12.2f}{o.risk_reward:<8.2f}{o.universal_prob:<16.1f}%{o.atr:<8.2f}")
+              f"{o.stop_loss:<12.2f}{o.risk_reward:<8.2f}{o.universal_prob:<9.1f}%{o.rvol:<8.2f}{o.vwap_dist:<12.2f}{o.atr:<8.2f}")
 
-    print("=" * 105)
+    print("=" * 120)
     tv_symbols = ", ".join([f"NSE:{o.ticker}" for o in opportunities[:20]])
     print("TOP 20 TRADINGVIEW WATCHLIST IMPORT STRING:")
     print(tv_symbols)
-    print("=" * 105)
-
-    # 4. GENERATE UNIVERSAL PINE SCRIPT v6
-    generate_pine_script_v6("strategy_v6.pine")
-    print("\n[+] Generated Universal 'strategy_v6.pine' for TradingView.")
+    print("=" * 120)
 
 
 if __name__ == "__main__":
