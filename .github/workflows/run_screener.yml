@@ -1,0 +1,26 @@
+name: Run NSE Quant Screener
+
+on:
+  workflow_dispatch: # Allows manual 1-click execution
+  schedule:
+    # Runs Monday-Friday at 15:15 IST (09:45 UTC) for BTST / EOD scanning
+    - cron: '45 9 * * 1-5'
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Screener Pipeline
+        run: python screener_pipeline.py
