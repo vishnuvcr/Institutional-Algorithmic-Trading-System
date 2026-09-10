@@ -2,7 +2,9 @@
 """
 INSTITUTIONAL INTRADAY ML ENGINE & PINE SCRIPT v6 GENERATOR (SHARDED)
 ====================================================================
-Fixed Probability Slicing, Robust Error Reporting, and Verified Population
+- Explicit 2D probability slicing (no scalar conversion errors)
+- Guaranteed generation of 'strategy_v6.pine' and 'final_ranked_results.csv'
+- Comprehensive logging per ticker to console
 """
 
 import os
@@ -24,11 +26,11 @@ from sklearn.linear_model import LogisticRegression
 
 warnings.filterwarnings("ignore")
 
-TARGET_PROFIT_PCT = 0.025       # 2.5% Target
+TARGET_PROFIT_PCT = 0.02        # 2.0% Target
 ATR_MULTIPLIER    = 1.50        # ATR Stop Loss Multiplier
 HORIZON_BARS      = 20          # Max forward bars (~5 hours on 15m)
-MIN_TRAIN_BARS    = 180         # Lookback threshold
-TEST_FOLD_BARS    = 40          # Walk-forward fold window
+MIN_TRAIN_BARS    = 150         # Lookback threshold
+TEST_FOLD_BARS    = 30          # Walk-forward fold window
 MIN_CONFIDENCE    = 0.50        # Statistical Edge Threshold (50%+)
 RISK_FREE_RATE    = 0.065       # Baseline rate (~6.5%)
 
@@ -54,20 +56,20 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     low = data['Low']
     volume = data['Volume']
 
-    # 1. RSI (14)
+    # RSI
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, min_periods=14).mean()
     rs = gain / (loss + 1e-9)
     data['RSI'] = 100.0 - (100.0 / (1.0 + rs))
 
-    # 2. Stochastic %K & %D
+    # Stochastic %K & %D
     low_14 = low.rolling(14).min()
     high_14 = high.rolling(14).max()
     data['Stoch_K'] = 100.0 * ((close - low_14) / (high_14 - low_14 + 1e-9))
     data['Stoch_D'] = data['Stoch_K'].rolling(3).mean()
 
-    # 3. ATR & NATR
+    # ATR & NATR
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -75,38 +77,28 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data['ATR'] = tr.ewm(alpha=1/14, min_periods=14).mean()
     data['NATR'] = (data['ATR'] / close) * 100.0
 
-    # 4. Bollinger Bands
+    # Bollinger Bands
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std(ddof=1)
     bb_up = bb_mid + 2.0 * bb_std
     bb_low = bb_mid - 2.0 * bb_std
     data['BB_PctB'] = (close - bb_low) / (bb_up - bb_low + 1e-9)
 
-    # 5. Money Flow Index (14)
+    # Money Flow Index
     tp = (high + low + close) / 3.0
     rmf = tp * volume
     pos_flow = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     neg_flow = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     data['MFI'] = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
 
-    # 6. Trend: EMA Ribbon
+    # EMA Ribbon
     ema8 = close.ewm(span=8, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema55 = close.ewm(span=55, adjust=False).mean()
     data['EMA_Ribbon_Spread'] = (ema8 - ema55) / (ema55 + 1e-9)
     data['EMA_Short_Spread'] = (ema8 - ema21) / (ema21 + 1e-9)
 
-    # 7. Directional Movement Index (ADX)
-    up_m = high - high.shift(1)
-    down_m = low.shift(1) - low
-    p_dm = np.where((up_m > down_m) & (up_m > 0), up_m, 0.0)
-    m_dm = np.where((down_m > up_m) & (down_m > 0), down_m, 0.0)
-    tr_s = tr.ewm(alpha=1/14, min_periods=14).mean()
-    p_di = 100.0 * pd.Series(p_dm, index=data.index).ewm(alpha=1/14, min_periods=14).mean() / (tr_s + 1e-9)
-    m_di = 100.0 * pd.Series(m_dm, index=data.index).ewm(alpha=1/14, min_periods=14).mean() / (tr_s + 1e-9)
-    data['DI_Diff'] = p_di - m_di
-
-    # 8. Momentum Return
+    # Momentum Return
     data['ROC_4'] = close.pct_change(4)
 
     return data
@@ -139,9 +131,9 @@ def generate_triple_barrier_labels(df: pd.DataFrame) -> pd.Series:
 
 
 def build_ml_ensemble() -> VotingClassifier:
-    clf_gbm = HistGradientBoostingClassifier(max_iter=40, max_depth=3, learning_rate=0.05, random_state=42)
+    clf_gbm = HistGradientBoostingClassifier(max_iter=30, max_depth=3, learning_rate=0.05, random_state=42)
     clf_knn = KNeighborsClassifier(n_neighbors=7, weights='distance', metric='manhattan')
-    clf_lr = LogisticRegression(C=0.1, max_iter=300, random_state=42)
+    clf_lr = LogisticRegression(C=0.1, max_iter=200, random_state=42)
     return VotingClassifier(estimators=[('gbm', clf_gbm), ('knn', clf_knn), ('lr', clf_lr)], voting='soft')
 
 
@@ -159,6 +151,8 @@ def run_walk_forward_validation(X: pd.DataFrame, y: pd.Series, df_raw: pd.DataFr
     low_arr = df_raw['Low'].values
     atr_arr = df_raw['ATR'].values
 
+    col_win = 1
+
     for start_test in range(MIN_TRAIN_BARS, n_samples - TEST_FOLD_BARS, TEST_FOLD_BARS):
         end_test = start_test + TEST_FOLD_BARS
         purge_idx = start_test - HORIZON_BARS
@@ -175,8 +169,8 @@ def run_walk_forward_validation(X: pd.DataFrame, y: pd.Series, df_raw: pd.DataFr
         model = build_ml_ensemble()
         model.fit(X_train_scaled, y_train)
 
-        # FIXED: Slice class 1 probabilities directly as a 1D float array
-        test_probs = model.predict_proba(X_test_scaled)
+        # Explicitly slice win probability column
+        test_probs = model.predict_proba(X_test_scaled)[:, col_win]
 
         for i_local in range(len(test_probs)):
             prob_val = float(test_probs[i_local])
@@ -243,7 +237,7 @@ def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
     yf_symbol = f"{clean_ticker}.NS"
     try:
         df = yf.download(yf_symbol, period="60d", interval="15m", progress=False)
-        if df is None or len(df) < (MIN_TRAIN_BARS + 20):
+        if df is None or len(df) < MIN_TRAIN_BARS:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -257,7 +251,7 @@ def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
 
         feature_cols = [
             'RSI', 'Stoch_K', 'Stoch_D', 'NATR', 'BB_PctB', 
-            'MFI', 'EMA_Ribbon_Spread', 'EMA_Short_Spread', 'DI_Diff', 'ROC_4'
+            'MFI', 'EMA_Ribbon_Spread', 'EMA_Short_Spread', 'ROC_4'
         ]
 
         valid_indices = df_feat.index[:-HORIZON_BARS]
@@ -275,11 +269,14 @@ def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
         ensemble = build_ml_ensemble()
         ensemble.fit(X_train_scaled, y_train_full)
 
-        # FIXED: Extract scalar class 1 probability from 2D predict_proba
         latest_features = df_feat.iloc[[-1]][feature_cols]
         latest_scaled = scaler.transform(latest_features)
+        
+        # Explicitly extract row 0, column 1 (win probability)
         proba_matrix = ensemble.predict_proba(latest_scaled)
-        live_prob = float(proba_matrix)
+        row_first = 0
+        col_win = 1
+        live_prob = float(proba_matrix[row_first, col_win])
 
         last_close = float(df_feat.iloc[-1]['Close'])
         last_atr = float(df_feat.iloc[-1]['ATR'])
@@ -302,6 +299,258 @@ def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
     except Exception as e:
         print(f"[-] Evaluation note for {clean_ticker}: {e}")
         return None
+
+
+def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
+    pine_code = """//@version=6
+strategy("Institutional Quantitative Engine [v6]", 
+         shorttitle="QUANT_V6", 
+         overlay=true, 
+         initial_capital=1000000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10, 
+         commission_type=strategy.commission.percent, 
+         commission_value=0.03, 
+         slippage=2,
+         pyramiding=0)
+
+var string G_MODE       = "Operational Mode & Time Horizons"
+i_tradeMode             = input.string("Intraday (15m)", "Trading Mode", options=["Scalping (1m-5m)", "Intraday (15m)", "Swing (Daily)", "BTST (EOD)"], group=G_MODE)
+i_enableShorts          = input.bool(true, "Enable Short Trades", group=G_MODE)
+
+var string G_RISK       = "Risk & Position Controls"
+i_targetProfitPct       = input.float(2.0, "Take Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
+i_atrSlMultiplier       = input.float(1.50, "ATR Stop Loss Multiplier", minval=0.5, step=0.25, group=G_RISK)
+i_atrLength             = input.int(14, "ATR Length", minval=1, group=G_RISK)
+i_enableBreakeven       = input.bool(true, "Enable Breakeven Ratchet", group=G_RISK)
+i_breakevenTriggerPct   = input.float(1.2, "Breakeven Activation Gain (%)", minval=0.5, step=0.25, group=G_RISK)
+
+var string G_ML         = "Lorentzian Classification Parameters"
+i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxval=50, group=G_ML)
+i_trainingWindow        = input.int(250, "Training Historical Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
+i_confidenceThresh      = input.float(52.0, "Minimum Model Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
+
+f_calc_rsi(int len) =>
+    float rawRsi = ta.rsi(close, len)
+    (rawRsi - 50.0) / 50.0
+
+f_calc_cci(int len) =>
+    float rawCci = ta.cci(close, len)
+    math.max(math.min(rawCci / 200.0, 1.0), -1.0)
+
+f_calc_tsi(int longLen, int shortLen) =>
+    float rawTsi = ta.tsi(close, longLen, shortLen)
+    rawTsi / 100.0
+
+f_calc_mfi(int len) =>
+    float rawMfi = ta.mfi(hlc3, len)
+    (rawMfi - 50.0) / 50.0
+
+f_calc_adx_diff(int len) =>
+    [diPlus, diMinus, adxVal] = ta.dmi(len, len)
+    float diff = (diPlus - diMinus) / 100.0
+    math.max(math.min(diff, 1.0), -1.0)
+
+f1 = f_calc_rsi(14)
+f2 = f_calc_cci(20)
+f3 = f_calc_tsi(25, 13)
+f4 = f_calc_mfi(14)
+f5 = f_calc_adx_diff(14)
+
+f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, 
+                  float y1, float y2, float y3, float y4, float y5) =>
+    float d1 = math.log(1.0 + math.abs(x1 - y1))
+    float d2 = math.log(1.0 + math.abs(x2 - y2))
+    float d3 = math.log(1.0 + math.abs(x3 - y3))
+    float d4 = math.log(1.0 + math.abs(x4 - y4))
+    float d5 = math.log(1.0 + math.abs(x5 - y5))
+    d1 + d2 + d3 + d4 + d5
+
+var array<float> arr_f1     = array.new_float(0)
+var array<float> arr_f2     = array.new_float(0)
+var array<float> arr_f3     = array.new_float(0)
+var array<float> arr_f4     = array.new_float(0)
+var array<float> arr_f5     = array.new_float(0)
+var array<int>   arr_labels = array.new_int(0)
+
+var int lb = 4
+int historicalLabel = close > close[lb] ? 1 : -1
+
+if bar_index > 10
+    array.push(arr_f1, f1[lb])
+    array.push(arr_f2, f2[lb])
+    array.push(arr_f3, f3[lb])
+    array.push(arr_f4, f4[lb])
+    array.push(arr_f5, f5[lb])
+    array.push(arr_labels, historicalLabel)
+    if array.size(arr_labels) > i_trainingWindow
+        array.shift(arr_f1)
+        array.shift(arr_f2)
+        array.shift(arr_f3)
+        array.shift(arr_f4)
+        array.shift(arr_f5)
+        array.shift(arr_labels)
+
+int countBull = 0
+int countBear = 0
+int totalSamples = array.size(arr_labels)
+
+if totalSamples >= math.max(i_kNeighbors, 20)
+    array<float> distances = array.new_float(totalSamples)
+    array<int>   indices   = array.new_int(totalSamples)
+    
+    for i = 0 to totalSamples - 1
+        float dist = f_lorentzian_dist(f1, f2, f3, f4, f5, 
+                                      array.get(arr_f1, i), 
+                                      array.get(arr_f2, i), 
+                                      array.get(arr_f3, i), 
+                                      array.get(arr_f4, i), 
+                                      array.get(arr_f5, i))
+        array.set(distances, i, dist)
+        array.set(indices, i, i)
+
+    int sortLimit = math.min(i_kNeighbors, totalSamples - 1)
+    if sortLimit > 0
+        for i = 0 to sortLimit - 1
+            int minIdx = i
+            for j = i + 1 to totalSamples - 1
+                if array.get(distances, j) < array.get(distances, minIdx)
+                    minIdx := j
+            if minIdx != i
+                float tempD = array.get(distances, i)
+                array.set(distances, i, array.get(distances, minIdx))
+                array.set(distances, minIdx, tempD)
+                
+                int tempI = array.get(indices, i)
+                array.set(indices, i, array.get(indices, minIdx))
+                array.set(indices, minIdx, tempI)
+
+    for i = 0 to i_kNeighbors - 1
+        int neighborIdx = array.get(indices, i)
+        int lbl = array.get(arr_labels, neighborIdx)
+        if lbl == 1
+            countBull += 1
+        else
+            countBear += 1
+
+float modelConfidence = 0.0
+int mlDirection = 0
+
+if (countBull + countBear) > 0
+    if countBull > countBear
+        modelConfidence := (float(countBull) / float(i_kNeighbors)) * 100.0
+        if modelConfidence >= i_confidenceThresh
+            mlDirection := 1
+    else
+        modelConfidence := (float(countBear) / float(i_kNeighbors)) * 100.0
+        if modelConfidence >= i_confidenceThresh
+            mlDirection := -1
+
+bool modeConditionBuy  = (mlDirection == 1)
+bool modeConditionSell = (mlDirection == -1) and i_enableShorts
+
+float atrVal = ta.atr(i_atrLength)
+
+var float entryPriceLocal = 0.0
+var float targetPrice     = 0.0
+var float stopLossPrice   = 0.0
+var bool  isBreakeven     = false
+
+var line lineTP    = na
+var line lineSL    = na
+var line lineEntry = na
+
+bool inLongPosition  = strategy.position_size > 0
+bool inShortPosition = strategy.position_size < 0
+
+if modeConditionBuy and not inLongPosition and barstate.isconfirmed
+    entryPriceLocal := close
+    targetPrice     := entryPriceLocal * (1.0 + (i_targetProfitPct / 100.0))
+    stopLossPrice   := entryPriceLocal - (atrVal * i_atrSlMultiplier)
+    isBreakeven     := false
+    strategy.entry("BUY", strategy.long)
+    
+    line.delete(lineTP)
+    line.delete(lineSL)
+    line.delete(lineEntry)
+    lineEntry := line.new(bar_index, entryPriceLocal, bar_index + 10, entryPriceLocal, color=color.blue, width=2)
+    lineTP    := line.new(bar_index, targetPrice,     bar_index + 10, targetPrice,     color=color.green, width=2, style=line.style_dashed)
+    lineSL    := line.new(bar_index, stopLossPrice,   bar_index + 10, stopLossPrice,   color=color.red, width=2, style=line.style_dashed)
+
+if modeConditionSell and not inShortPosition and barstate.isconfirmed
+    entryPriceLocal := close
+    targetPrice     := entryPriceLocal * (1.0 - (i_targetProfitPct / 100.0))
+    stopLossPrice   := entryPriceLocal + (atrVal * i_atrSlMultiplier)
+    isBreakeven     := false
+    strategy.entry("SELL", strategy.short)
+    
+    line.delete(lineTP)
+    line.delete(lineSL)
+    line.delete(lineEntry)
+    lineEntry := line.new(bar_index, entryPriceLocal, bar_index + 10, entryPriceLocal, color=color.blue, width=2)
+    lineTP    := line.new(bar_index, targetPrice,     bar_index + 10, targetPrice,     color=color.green, width=2, style=line.style_dashed)
+    lineSL    := line.new(bar_index, stopLossPrice,   bar_index + 10, stopLossPrice,   color=color.red, width=2, style=line.style_dashed)
+
+if inLongPosition
+    if i_enableBreakeven and not isBreakeven and (high >= entryPriceLocal * (1.0 + (i_breakevenTriggerPct / 100.0)))
+        stopLossPrice := entryPriceLocal
+        isBreakeven   := true
+        line.set_y1(lineSL, stopLossPrice)
+        line.set_y2(lineSL, stopLossPrice)
+        line.set_color(lineSL, color.orange)
+    strategy.exit("Exit_BUY", "BUY", limit=targetPrice, stop=stopLossPrice)
+
+if inShortPosition
+    if i_enableBreakeven and not isBreakeven and (low <= entryPriceLocal * (1.0 - (i_breakevenTriggerPct / 100.0)))
+        stopLossPrice := entryPriceLocal
+        isBreakeven   := true
+        line.set_y1(lineSL, stopLossPrice)
+        line.set_y2(lineSL, stopLossPrice)
+        line.set_color(lineSL, color.orange)
+    strategy.exit("Exit_SELL", "SELL", limit=targetPrice, stop=stopLossPrice)
+
+if (inLongPosition or inShortPosition)
+    line.set_x2(lineEntry, bar_index + 3)
+    line.set_x2(lineTP, bar_index + 3)
+    line.set_x2(lineSL, bar_index + 3)
+
+var table hud = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    float rrRatio = 0.0
+    if math.abs(entryPriceLocal - stopLossPrice) > 0.0001
+        rrRatio := math.abs(targetPrice - entryPriceLocal) / math.abs(entryPriceLocal - stopLossPrice)
+        
+    table.cell(hud, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    table.cell(hud, 1, 0, "Value",  text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    
+    table.cell(hud, 0, 1, "ML Confidence", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(modelConfidence, "#.#") + "%", 
+               text_color=modelConfidence >= i_confidenceThresh ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(hud, 0, 2, "Market Bias", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 2, mlDirection == 1 ? "BULLISH" : mlDirection == -1 ? "BEARISH" : "NEUTRAL", 
+               text_color=mlDirection == 1 ? color.green : mlDirection == -1 ? color.red : color.gray, text_size=size.small)
+    
+    table.cell(hud, 0, 3, "Entry Price", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 3, inLongPosition or inShortPosition ? str.tostring(entryPriceLocal, "#.##") : "-", text_color=color.white, text_size=size.small)
+    
+    table.cell(hud, 0, 4, "Target", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 4, inLongPosition or inShortPosition ? str.tostring(targetPrice, "#.##") : "-", text_color=color.green, text_size=size.small)
+    
+    table.cell(hud, 0, 5, "Stop Loss", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 5, inLongPosition or inShortPosition ? str.tostring(stopLossPrice, "#.##") : "-", 
+               text_color=isBreakeven ? color.orange : color.red, text_size=size.small)
+    
+    table.cell(hud, 0, 6, "Risk : Reward", text_color=color.silver, text_size=size.small)
+    table.cell(hud, 1, 6, inLongPosition or inShortPosition ? ("1 : " + str.tostring(rrRatio, "#.##")) : "-", text_color=color.yellow, text_size=size.small)
+
+plotshape(modeConditionBuy and not inLongPosition, title="Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(modeConditionSell and not inShortPosition, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+"""
+    with open(output_path, "w") as f:
+        f.write(pine_code)
+    return pine_code
 
 
 def run_shard(shard_id: int, num_shards: int, ticker_file: str, output_csv: str) -> None:
@@ -344,6 +593,10 @@ def merge_and_display() -> None:
     print("\n" + "=" * 115)
     print(f"{'MERGING ALL SHARD ARTIFACTS & COMPUTING MASTER RANKING':^115}")
     print("=" * 115)
+
+    # UNCONDITIONALLY GENERATE PINE SCRIPT v6 SO ARTIFACT UPLOAD NEVER FAILS
+    generate_pine_script_v6("strategy_v6.pine")
+    print("[+] Successfully generated 'strategy_v6.pine'.")
 
     empty_cols = ["ticker", "direction", "entry_price", "target_price", "stop_loss", 
                   "risk_reward", "ensemble_prob", "historical_win_rate", "max_drawdown", "fitness_score"]
