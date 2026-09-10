@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-INSTITUTIONAL QUANTITATIVE ML PIPELINE (NSE)
-============================================
-Follows the 9-Step Quantitative Research Architecture:
-Step 1: Multi-Ticker Intraday OHLCV Ingestion (NSE)
-Step 2: K-Fold Time-Series Partitioning (Zero Lookahead / Purged)
-Step 3 & 4: Develop Multiple Trading ML Models
-Step 5: Individual Out-of-Sample Performance Benchmarking
-Step 6: Optimal Ensemble Discovery (Soft Voting vs Weighted Blending vs Stacking)
-Step 7: Automated Hyperparameter Grid Optimization
-Step 8: Formulate Master Swing Trading Setups
-Step 9: Direct Output of 'strategy_v6.pine' Strategy Script
+INSTITUTIONAL QUANTITATIVE ML PIPELINE (FULL NSE UNIVERSE)
+==========================================================
+- Batch Data Ingestion: Ingests all 2,100+ tickers in chunks of 50
+- Automated Liquidity Filter: Discards illiquid / halted stocks
+- Universal Training: Pools all liquid NSE stocks into one master brain
+- Cross-Sectional Ranking: Evaluates and ranks the entire market
 """
 
 import os
@@ -22,7 +17,6 @@ import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 # Scikit-Learn Stack
@@ -40,12 +34,13 @@ TARGET_PROFIT_PCT = 0.05       # 5.0% Fixed Swing Target
 ATR_SL_MULTIPLIER = 1.75       # ATR Stop Loss Multiplier
 HORIZON_BARS      = 24         # Evaluation Window (~6 hours on 15m)
 K_FOLDS           = 4          # K-Fold Time Series Splits
-TOP_TICKERS_COUNT = 30         # Liquid Stock Universe Pool
-EXPORT_LIMIT      = 25         # Top ranked stocks to display
+BATCH_CHUNK_SIZE  = 50         # Ingest 50 tickers per batch call
+MIN_BARS_REQUIRED = 200        # Filters out illiquid stocks with gaps
+EXPORT_LIMIT      = 50         # Top ranked stocks to display
 
 
 # =============================================================================
-# STEP 1: DOWNLOAD ALL INTRADAY DATA (PRICES & VOLUMES)
+# FEATURE EXTRACTION ENGINE
 # =============================================================================
 def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
@@ -54,7 +49,7 @@ def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     low = data['Low']
     volume = data['Volume']
 
-    # 1. Volume Dynamics: Relative Volume (RVOL) & Money Flow (MFI)
+    # Volume Dynamics
     vol_sma20 = volume.rolling(20).mean()
     data['RVOL'] = volume / (vol_sma20 + 1e-9)
     
@@ -69,7 +64,7 @@ def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     neg_flow = pd.Series(np.where(typical_p < typical_p.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     data['MFI_Norm'] = ((100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))) - 50.0) / 50.0
 
-    # 2. Momentum: RSI & Stochastic
+    # Momentum
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, min_periods=14).mean()
@@ -80,7 +75,7 @@ def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     high_14 = high.rolling(14).max()
     data['Stoch_Norm'] = ((100.0 * (close - low_14) / (high_14 - low_14 + 1e-9)) - 50.0) / 50.0
 
-    # 3. Volatility: ATR & Bollinger Bands
+    # Volatility
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -92,7 +87,7 @@ def compute_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
     bb_std = close.rolling(20).std(ddof=1)
     data['BB_Norm'] = ((close - (bb_mid - 2.0 * bb_std)) / (4.0 * bb_std + 1e-9)) - 0.5
 
-    # 4. Trend Ribbon Dispersion
+    # Trend Ribbon
     ema8 = close.ewm(span=8, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema55 = close.ewm(span=55, adjust=False).mean()
@@ -128,28 +123,6 @@ def create_triple_barrier_labels(df: pd.DataFrame) -> pd.Series:
     return pd.Series(labels, index=df.index)
 
 
-def fetch_and_prepare_stock(ticker: str) -> Optional[Tuple[pd.DataFrame, pd.Series, pd.Series]]:
-    clean_t = ticker.strip().upper()
-    try:
-        df = yf.download(f"{clean_t}.NS", period="60d", interval="15m", progress=False)
-        if df is None or len(df) < 200:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df_feat = compute_institutional_features(df).dropna()
-        if len(df_feat) < 180:
-            return None
-
-        labels = create_triple_barrier_labels(df_feat)
-        valid_idx = df_feat.index[:-HORIZON_BARS]
-        latest_row = df_feat.iloc[-1]
-        
-        return (df_feat.loc[valid_idx], labels.loc[valid_idx], latest_row)
-    except Exception:
-        return None
-
-
 def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
     pine_code = """//@version=6
 strategy("Master Institutional ML Swing Engine [v6]", 
@@ -163,7 +136,6 @@ strategy("Master Institutional ML Swing Engine [v6]",
          slippage=2,
          pyramiding=0)
 
-// 1. INPUT CONFIGURATION & TUNED HYPERPARAMETERS
 var string G_RISK       = "Risk Controls"
 i_targetProfitPct       = input.float(5.0, "Fixed Profit Target (%)", minval=0.5, step=0.25, group=G_RISK)
 i_atrSlMultiplier       = input.float(1.75, "ATR Stop Loss Multiplier", minval=0.5, step=0.25, group=G_RISK)
@@ -176,11 +148,10 @@ i_kNeighbors            = input.int(8, "k-Nearest Neighbors (k)", minval=1, maxv
 i_trainingWindow        = input.int(250, "Training Horizon (Bars)", minval=50, maxval=2000, group=G_ML)
 i_confidenceThresh      = input.float(52.0, "Ensemble Confidence (%)", minval=50.0, maxval=95.0, step=1.0, group=G_ML)
 
-// 2. FEATURE EXTRACTION PIPELINE
+// Feature Normalization
 float volSma20 = ta.sma(volume, 20)
 float f_rvol   = math.min((volume / (volSma20 + 1e-9)) / 3.0, 1.0)
 float f_mfi    = (ta.mfi(hlc3, 14) - 50.0) / 50.0
-
 float f_rsi    = (ta.rsi(close, 14) - 50.0) / 50.0
 float f_tsi    = ta.tsi(close, 25, 13) / 100.0
 
@@ -193,7 +164,7 @@ float f_ribbon = math.max(math.min((ema8 - ema55) / (ema55 + 1e-9) * 10.0, 1.0),
 [bbMid, bbUp, bbLow] = ta.bb(close, 20, 2)
 float f_bb     = ((close - bbLow) / (bbUp - bbLow + 1e-9)) - 0.5
 
-// 3. LORENTZIAN DISTANCE MACHINE LEARNING ENGINE
+// Lorentzian Distance Metric
 f_lorentzian_dist(float x1, float x2, float x3, float x4, float x5, float x6, float x7,
                   float y1, float y2, float y3, float y4, float y5, float y6, float y7) =>
     math.log(1.0 + math.abs(x1 - y1)) +
@@ -287,7 +258,7 @@ if (countBull + countBear) > 0
         if modelConfidence >= i_confidenceThresh
             mlDirection := -1
 
-// 4. STRATEGY EXECUTION
+// Strategy Execution
 float atrVal = ta.atr(i_atrLength)
 var float entryPriceLocal = 0.0
 var float targetPrice     = 0.0
@@ -328,27 +299,21 @@ if inLongPosition
     line.set_x2(lineTP, bar_index + 3)
     line.set_x2(lineSL, bar_index + 3)
 
-// 5. HUD TABLE
 var table hud = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray)
 
 if barstate.islast
     table.cell(hud, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.navy)
     table.cell(hud, 1, 0, "Value",  text_color=color.white, text_size=size.small, bgcolor=color.navy)
-    
     table.cell(hud, 0, 1, "Ensemble ML", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 1, str.tostring(modelConfidence, "#.#") + "%", 
                text_color=modelConfidence >= i_confidenceThresh ? color.lime : color.gray, text_size=size.small)
-    
     table.cell(hud, 0, 2, "Market Bias", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 2, mlDirection == 1 ? "BULLISH" : "NEUTRAL", 
                text_color=mlDirection == 1 ? color.green : color.gray, text_size=size.small)
-    
     table.cell(hud, 0, 3, "Entry Price", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 3, inLongPosition ? str.tostring(entryPriceLocal, "#.##") : "-", text_color=color.white, text_size=size.small)
-    
     table.cell(hud, 0, 4, "Target (+5.0%)", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 4, inLongPosition ? str.tostring(targetPrice, "#.##") : "-", text_color=color.green, text_size=size.small)
-    
     table.cell(hud, 0, 5, "Stop Loss", text_color=color.silver, text_size=size.small)
     table.cell(hud, 1, 5, inLongPosition ? str.tostring(stopLossPrice, "#.##") : "-", 
                text_color=isBreakeven ? color.orange : color.red, text_size=size.small)
@@ -361,65 +326,91 @@ plotshape(mlDirection == 1 and not inLongPosition, title="Buy Signal", style=sha
 
 
 # =============================================================================
-# MAIN PIPELINE EXECUTION
+# MAIN MULTI-TICKER UNIVERSE PIPELINE
 # =============================================================================
 def main():
-    # Always generate the Pine Script strategy so artifact upload succeeds
     generate_pine_script_v6("strategy_v6.pine")
 
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file):
-        sample = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "BHARTIARTL", "SBIN", "LICI", "ITC", "LT"]
-        with open(ticker_file, "w") as f:
-            f.write("\n".join(sample))
+        print(f"[-] {ticker_file} not found.")
+        sys.exit(1)
 
     with open(ticker_file, "r") as f:
-        all_tickers = [line.strip().upper() for line in f if line.strip()][:TOP_TICKERS_COUNT]
+        all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    print("\n" + "=" * 100)
-    print("STEP 1: INGESTING INTRADAY DATA (PRICES & VOLUMES) ACROSS UNIVERSE")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print(f"STEP 1: INGESTING FULL NSE UNIVERSE ({len(all_tickers):,} STOCKS) IN CONCURRENT BATCHES")
+    print("=" * 110)
 
     feature_cols = ['RVOL', 'VWAP_Dist', 'MFI_Norm', 'RSI_Norm', 'Stoch_Norm', 'NATR', 'BB_Norm', 'Ribbon_Spread', 'Fast_Spread']
     
     x_list, y_list = [], []
     latest_market_state = {}
+    valid_stocks_count = 0
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_map = {executor.submit(fetch_and_prepare_stock, t): t for t in all_tickers}
-        for future in as_completed(future_map):
-            t = future_map[future]
-            res = future.result()
-            if res is not None:
-                df_stock, labels_stock, last_bar = res
-                x_list.append(df_stock[feature_cols])
-                y_list.append(labels_stock)
-                latest_market_state[t] = last_bar
-                print(f"[+] Ingested {t:<12} | {len(df_stock):,} bars | Vol & VWAP computed")
+    # Chunk the entire 2,100+ universe into groups of 50
+    chunks = [all_tickers[i:i + BATCH_CHUNK_SIZE] for i in range(0, len(all_tickers), BATCH_CHUNK_SIZE)]
+
+    for chunk_idx, chunk in enumerate(chunks, start=1):
+        yf_symbols = [f"{t}.NS" for t in chunk]
+        try:
+            # Batch download 50 stocks in a single network request
+            batch_df = yf.download(yf_symbols, period="60d", interval="15m", group_by="ticker", progress=False, threads=True)
+            if batch_df is None or batch_df.empty:
+                continue
+
+            for t in chunk:
+                try:
+                    df_single = batch_df[f"{t}.NS"] if f"{t}.NS" in batch_df else batch_df[t]
+                    df_single = df_single.dropna(subset=['Close'])
+                    
+                    # Automated Liquidity Filter
+                    if len(df_single) < MIN_BARS_REQUIRED:
+                        continue
+
+                    df_feat = compute_institutional_features(df_single).dropna()
+                    if len(df_feat) < (MIN_BARS_REQUIRED - 30):
+                        continue
+
+                    labels = create_triple_barrier_labels(df_feat)
+                    valid_idx = df_feat.index[:-HORIZON_BARS]
+
+                    x_list.append(df_feat.loc[valid_idx, feature_cols])
+                    y_list.append(labels.loc[valid_idx])
+                    latest_market_state[t] = df_feat.iloc[-1]
+                    valid_stocks_count += 1
+                except Exception:
+                    continue
+
+            print(f"[*] Processed Batch {chunk_idx:2d}/{len(chunks)} | Active Liquid Stocks Found: {valid_stocks_count}")
+        except Exception as e:
+            print(f"[-] Batch {chunk_idx} skipped due to connection timeout: {e}")
 
     if not x_list:
-        print("[-] Data download failed.")
+        print("[-] Insufficient data to train.")
         pd.DataFrame().to_csv("final_ranked_results.csv", index=False)
         return
 
     X_full = pd.concat(x_list, ignore_index=True)
     y_full = pd.concat(y_list, ignore_index=True)
 
-    print(f"\n[✓] Pooled Master Training Matrix: {len(X_full):,} bars across {len(latest_market_state)} stocks.")
-    print(f"[✓] Class Distribution: Bull Targets (1): {sum(y_full == 1):,} | Stops/Timeouts (0): {sum(y_full == 0):,}")
+    print("-" * 110)
+    print(f"[✓] Total Pooled Universal Observations: {len(X_full):,} bars across {valid_stocks_count} liquid NSE stocks.")
+    print(f"[✓] Bullish Setups (Class 1): {sum(y_full == 1):,} | Other/Stops (Class 0): {sum(y_full == 0):,}")
 
     # =========================================================================
-    # STEP 2: SPLIT INTO TRAINING & TEST SETS BY K-PARTITIONING
+    # STEP 2: K-FOLD TIME SERIES SPLIT
     # =========================================================================
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 110)
     print(f"STEP 2: K-PARTITIONING (TIME-SERIES SPLITS: K={K_FOLDS})")
-    print("=" * 100)
+    print("=" * 110)
 
     tscv = TimeSeriesSplit(n_splits=K_FOLDS)
     scaler = StandardScaler()
 
     for fold_idx, (train_indices, test_indices) in enumerate(tscv.split(X_full), start=1):
-        print(f" -> Fold {fold_idx}: Train Window = {len(train_indices):,} samples | Test Window = {len(test_indices):,} samples")
+        print(f" -> Fold {fold_idx}: Train Window = {len(train_indices):,} bars | Test Window = {len(test_indices):,} bars")
 
     X_train_raw = X_full.iloc[train_indices]
     y_train = y_full.iloc[train_indices]
@@ -430,11 +421,11 @@ def main():
     X_test = scaler.transform(X_test_raw)
 
     # =========================================================================
-    # STEP 3 & 4: DEVELOP & TRAIN MULTIPLE TRADING ML MODELS
+    # STEP 3, 4 & 5: MULTI-MODEL DEVELOPMENT & OUT-OF-SAMPLE BENCHMARK
     # =========================================================================
-    print("\n" + "=" * 100)
-    print("STEP 3 & 4: DEVELOPING & TRAINING CANDIDATE ML MODELS")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print("STEP 3, 4 & 5: TRAINING & BENCHMARKING MULTIPLE ML CANDIDATE MODELS")
+    print("=" * 110)
 
     candidate_models = {
         "HistGradientBoosting": HistGradientBoostingClassifier(max_iter=50, max_depth=4, learning_rate=0.05, random_state=42),
@@ -442,15 +433,6 @@ def main():
         "k-NearestNeighbors":   KNeighborsClassifier(n_neighbors=9, weights='distance', metric='manhattan', n_jobs=-1),
         "RegularizedLogistic":  LogisticRegression(C=0.1, penalty='l2', max_iter=400, random_state=42)
     }
-
-    # =========================================================================
-    # STEP 5: TEST PERFORMANCE OF ALL MODELS INDIVIDUALLY ON TEST SET
-    # =========================================================================
-    print("\n" + "=" * 100)
-    print("STEP 5: BENCHMARKING INDIVIDUAL MODEL PERFORMANCE ON OUT-OF-SAMPLE TEST SET")
-    print("=" * 100)
-    print(f"{'Model Name':<24}{'OOS Accuracy':<16}{'OOS Precision':<16}{'ROC-AUC Score':<16}")
-    print("-" * 72)
 
     col_win = 1
     individual_scores = {}
@@ -463,24 +445,16 @@ def main():
         acc = accuracy_score(y_test, preds) * 100.0
         prec = precision_score(y_test, preds, zero_division=0) * 100.0
         auc = roc_auc_score(y_test, probs)
-
         individual_scores[name] = auc
-        print(f"{name:<24}{acc:<15.2f}%{prec:<15.2f}%{auc:<16.4f}")
+        print(f"{name:<24} | OOS Accuracy: {acc:5.2f}% | Precision: {prec:5.2f}% | ROC-AUC: {auc:.4f}")
 
     # =========================================================================
-    # STEP 6: FIND THE BEST WAY TO ENSEMBLE THE BEST MODELS
+    # STEP 6: ENSEMBLE DISCOVERY
     # =========================================================================
-    print("\n" + "=" * 100)
-    print("STEP 6: ENSEMBLE DISCOVERY (COMPARING VOTING VS STACKING)")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print("STEP 6: DISCOVERING OPTIMAL ENSEMBLE (VOTING VS STACKING)")
+    print("=" * 110)
 
-    sorted_scores = sorted(individual_scores.items(), key=itemgetter(1), reverse=True)
-    iter_scores = iter(sorted_scores)
-    top_first, _ = next(iter_scores)
-    top_second, _ = next(iter_scores)
-    print(f"[*] Top Performing Base Estimators: {top_first} & {top_second}")
-
-    # Using valid Python tuples to avoid syntax issues
     weights_tuple = (2, 1, 1, 1)
     ensembles = {
         "Soft-Voting (Uniform)": VotingClassifier(
@@ -508,23 +482,22 @@ def main():
         probs = ens.predict_proba(X_test)[:, col_win]
         auc = roc_auc_score(y_test, probs)
         acc = accuracy_score(y_test, ens.predict(X_test)) * 100.0
-        print(f"{e_name:<26} | OOS Accuracy: {acc:.2f}% | ROC-AUC: {auc:.4f}")
+        print(f"{e_name:<26} | OOS Accuracy: {acc:5.2f}% | ROC-AUC: {auc:.4f}")
         
         if auc > best_ensemble_auc:
             best_ensemble_auc = auc
             best_ensemble_name = e_name
             best_ensemble_model = ens
 
-    print(f"\n[✓] WINNING ENSEMBLE: '{best_ensemble_name}' (ROC-AUC: {best_ensemble_auc:.4f})")
+    print(f"\n[✓] Optimal Ensemble Selected: '{best_ensemble_name}' (ROC-AUC: {best_ensemble_auc:.4f})")
 
     # =========================================================================
-    # STEP 7: HYPERPARAMETER TUNING OF THE ML PARAMETERS
+    # STEP 7: HYPERPARAMETER TUNING
     # =========================================================================
-    print("\n" + "=" * 100)
-    print("STEP 7: HYPERPARAMETER TUNING ON THE BEST GRADIENT BOOSTED ESTIMATOR")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print("STEP 7: HYPERPARAMETER GRID TUNING ON BEST ESTIMATOR")
+    print("=" * 110)
 
-    # Defined as tuples to avoid syntax errors
     param_grid = {
         'max_iter': (30, 50),
         'max_depth': (3, 4),
@@ -539,18 +512,19 @@ def main():
         n_jobs=-1
     )
     grid_search.fit(X_train, y_train)
-    print(f"[✓] Optimal Hyperparameters: {grid_search.best_params_}")
+    print(f"[✓] Tuned Hyperparameters: {grid_search.best_params_}")
     print(f"[✓] Tuned Cross-Validation ROC-AUC: {grid_search.best_score_:.4f}")
 
+    # Retrain best ensemble on the full dataset
     X_full_scaled = scaler.fit_transform(X_full)
     best_ensemble_model.fit(X_full_scaled, y_full)
 
     # =========================================================================
-    # STEP 8: DRAFT THE BEST SWING TRADING STRATEGY (LIVE SCREENER RANKING)
+    # STEP 8: SCORE & RANK ENTIRE NSE MARKET CROSS-SECTIONALLY
     # =========================================================================
-    print("\n" + "=" * 100)
-    print("STEP 8: EXECUTING MASTER SWING STRATEGY ON LIVE MARKET DATA")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print(f"STEP 8: SCORING & RANKING ALL {len(latest_market_state):,} ACTIVE NSE EQUITIES")
+    print("=" * 110)
 
     opportunities = []
     row_first = 0
@@ -583,20 +557,19 @@ def main():
 
     header = f"{'Rank':<6}{'Ticker':<14}{'Signal':<8}{'Entry (₹)':<12}{'Target (+5%)':<14}{'Stop Loss':<12}{'R:R':<8}{'Win Prob':<12}{'RVOL':<8}{'VWAP Dist%':<12}"
     print(header)
-    print("-" * 100)
+    print("-" * 110)
     for rk, o in enumerate(opportunities[:EXPORT_LIMIT], start=1):
         print(f"{rk:<6}{o['ticker']:<14}{o['signal']:<8}{o['entry_price']:<12.2f}{o['target_5pct']:<14.2f}"
               f"{o['stop_loss']:<12.2f}{o['risk_reward']:<8.2f}{o['win_probability']:<10.1f}%{o['rvol']:<8.2f}{o['vwap_dist_pct']:<12.2f}")
 
-    print("=" * 100)
+    print("=" * 110)
     tv_export = ", ".join([f"NSE:{o['ticker']}" for o in opportunities[:EXPORT_LIMIT]])
-    print("TRADINGVIEW WATCHLIST EXPORT (TOP CANDIDATES):")
+    print(f"TOP {EXPORT_LIMIT} TRADINGVIEW WATCHLIST EXPORT:")
     print(tv_export)
-    print("=" * 100)
+    print("=" * 110)
 
-    # Save to CSV
     pd.DataFrame(opportunities).to_csv("final_ranked_results.csv", index=False)
-    print("\n[+] Saved to 'final_ranked_results.csv'")
+    print(f"\n[+] Successfully scanned {len(opportunities)} NSE stocks. Master results saved to 'final_ranked_results.csv'.")
 
 
 if __name__ == "__main__":
