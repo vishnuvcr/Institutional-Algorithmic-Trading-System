@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-INSTITUTIONAL INTRADAY ML ENGINE & PINE SCRIPT v6 GENERATOR (NSE)
-================================================================
-- Ingestion: 15-minute intraday bars
-- ML Stack: HistGradientBoosting + k-NN + L2-Logistic Ensemble
-- Output 1: Ranked Opportunity Table & TradingView Watchlist
-- Output 2: Auto-generated 'strategy_v6.pine' for TradingView backtesting
+INSTITUTIONAL INTRADAY ML ENGINE & PINE SCRIPT v6 GENERATOR (SHARDED)
+====================================================================
+Supports distributed parallel sharding via CLI parameters and automated result merging.
 """
 
 import os
 import sys
+import argparse
+import glob
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 from sklearn.preprocessing import StandardScaler
@@ -55,20 +55,20 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     low = data['Low']
     volume = data['Volume']
 
-    # RSI
+    # 1. RSI (14)
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, min_periods=14).mean()
     rs = gain / (loss + 1e-9)
     data['RSI'] = 100.0 - (100.0 / (1.0 + rs))
 
-    # Stochastic %K & %D
+    # 2. Stochastic %K & %D (14, 3)
     low_14 = low.rolling(14).min()
     high_14 = high.rolling(14).max()
     data['Stoch_K'] = 100.0 * ((close - low_14) / (high_14 - low_14 + 1e-9))
     data['Stoch_D'] = data['Stoch_K'].rolling(3).mean()
 
-    # ATR & NATR
+    # 3. ATR & NATR
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -76,7 +76,7 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data['ATR'] = tr.ewm(alpha=1/14, min_periods=14).mean()
     data['NATR'] = (data['ATR'] / close) * 100.0
 
-    # Bollinger Bands
+    # 4. Bollinger Bands (%B & Bandwidth)
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std(ddof=1)
     bb_up = bb_mid + 2.0 * bb_std
@@ -84,21 +84,21 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data['BB_PctB'] = (close - bb_low) / (bb_up - bb_low + 1e-9)
     data['BB_Width'] = (bb_up - bb_low) / (bb_mid + 1e-9)
 
-    # Money Flow Index
+    # 5. Money Flow Index (14)
     tp = (high + low + close) / 3.0
     rmf = tp * volume
     pos_flow = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     neg_flow = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=data.index).rolling(14).sum()
     data['MFI'] = 100.0 - (100.0 / (1.0 + (pos_flow / (neg_flow + 1e-9))))
 
-    # EMA Ribbon
+    # 6. Trend: EMA Ribbon Dispersion
     ema8 = close.ewm(span=8, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema55 = close.ewm(span=55, adjust=False).mean()
     data['EMA_Ribbon_Spread'] = (ema8 - ema55) / (ema55 + 1e-9)
     data['EMA_Short_Spread'] = (ema8 - ema21) / (ema21 + 1e-9)
 
-    # ADX & DI
+    # 7. ADX & Directional Differentials (14)
     up_m = high - high.shift(1)
     down_m = low.shift(1) - low
     p_dm = np.where((up_m > down_m) & (up_m > 0), up_m, 0.0)
@@ -110,7 +110,7 @@ def build_feature_store(df: pd.DataFrame) -> pd.DataFrame:
     data['ADX'] = dx.ewm(alpha=1/14, min_periods=14).mean()
     data['DI_Diff'] = p_di - m_di
 
-    # ROC
+    # 8. Intraday Momentum Returns
     data['ROC_4'] = close.pct_change(4)
     data['ROC_12'] = close.pct_change(12)
 
@@ -306,14 +306,7 @@ def evaluate_ticker_ml(raw_ticker: str) -> Optional[ScreenerOpportunity]:
         return None
 
 
-# =============================================================================
-# PINE SCRIPT v6 AUTO-GENERATOR
-# =============================================================================
 def generate_pine_script_v6(output_path: str = "strategy_v6.pine") -> str:
-    """
-    Generates a tested, compile-ready Pine Script v6 strategy script.
-    Includes the safe Lorentzian k-NN classifier, dynamic targets, and HUD table.
-    """
     pine_code = """//@version=6
 strategy("Institutional Quantitative Engine [v6]", 
          shorttitle="QUANT_V6", 
@@ -409,7 +402,6 @@ int countBull = 0
 int countBear = 0
 int totalSamples = array.size(arr_labels)
 
-// Require minimum 20 historical bars and totalSamples >= i_kNeighbors
 if totalSamples >= math.max(i_kNeighbors, 20)
     array<float> distances = array.new_float(totalSamples)
     array<int>   indices   = array.new_int(totalSamples)
@@ -608,60 +600,103 @@ plotshape(modeConditionSell and not inShortPosition, title="Sell Signal", style=
 
 
 # =============================================================================
-# MAIN EXECUTION
+# CLI ROUTING & SHARDING LOGIC
 # =============================================================================
-def main():
-    ticker_file = "tickers.txt"
+def run_shard(shard_id: int, num_shards: int, ticker_file: str, output_csv: str) -> None:
     if not os.path.exists(ticker_file):
-        sample_tickers = [
-            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
-            "BHARTIARTL", "SBIN", "LICI", "ITC", "HINDUNILVR"
-        ]
-        with open(ticker_file, "w") as f:
-            f.write("\n".join(sample_tickers))
+        print(f"[-] {ticker_file} not found.")
+        sys.exit(1)
 
     with open(ticker_file, "r") as f:
-        tickers = [line.strip().upper() for line in f if line.strip()]
+        all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    print("=" * 115)
-    print(f"INSTITUTIONAL INTRADAY ML ENGINE: SCREENING {len(tickers)} EQUITIES (15-MIN BARS)")
-    print("=" * 115)
+    # Modulo partition across shards
+    shard_tickers = [t for i, t in enumerate(all_tickers) if (i % num_shards) == shard_id]
+
+    print("=" * 90)
+    print(f"SHARD {shard_id + 1}/{num_shards}: PROCESSING {len(shard_tickers)} TICKERS (TOTAL POOL: {len(all_tickers)})")
+    print("=" * 90)
 
     opportunities: List[ScreenerOpportunity] = []
     
-    for idx, t in enumerate(tickers, start=1):
-        print(f"[{idx}/{len(tickers)}] Training Ensemble & Running WF-CV on {t}...", end="\r", flush=True)
-        res = evaluate_ticker_ml(t)
-        if res is not None:
-            opportunities.append(res)
+    # Internal multi-threading for parallel downloading & inference on the runner
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {executor.submit(evaluate_ticker_ml, t): t for t in shard_tickers}
+        for future in as_completed(future_map):
+            res = future.result()
+            if res is not None:
+                opportunities.append(res)
+                print(f"[+] Candidate Flagged: {res.ticker} | Prob: {res.ensemble_prob}% | Fitness: {res.fitness_score}")
 
-    print("\n" + "-" * 115)
-    if not opportunities:
-        print("[-] No stocks currently meet the 65% ML confidence threshold.")
+    # Export intermediate results to CSV
+    if opportunities:
+        df_out = pd.DataFrame([asdict(o) for o in opportunities])
+        df_out.to_csv(output_csv, index=False)
+        print(f"[+] Shard {shard_id} saved {len(opportunities)} opportunities to {output_csv}")
     else:
-        opportunities.sort(key=lambda x: x.fitness_score, reverse=True)
-        header = f"{'Ticker':<12}{'Signal':<6}{'Entry (₹)':<12}{'Target (+5%)':<14}{'Stop Loss':<12}{'R:R':<8}{'ML Prob (%)':<14}{'OOS Win %':<12}{'Max DD %':<10}{'Fitness':<10}"
-        print(header)
-        print("-" * 115)
-        for opp in opportunities:
-            print(f"{opp.ticker:<12}{opp.direction:<6}{opp.entry_price:<12.2f}{opp.target_price:<14.2f}"
-                  f"{opp.stop_loss:<12.2f}{opp.risk_reward:<8.2f}{opp.ensemble_prob:<14.1f}"
-                  f"{opp.historical_win_rate:<12.1f}{opp.max_drawdown:<10.1f}{opp.fitness_score:<10.3f}")
+        # Create empty CSV with headers
+        empty_cols = ["ticker", "direction", "entry_price", "target_price", "stop_loss", 
+                      "risk_reward", "ensemble_prob", "historical_win_rate", "max_drawdown", "fitness_score"]
+        pd.DataFrame(columns=empty_cols).to_csv(output_csv, index=False)
+        print(f"[-] Shard {shard_id}: No candidates met the threshold.")
 
-        print("=" * 115)
-        print("TRADINGVIEW WATCHLIST EXPORT:")
-        print(", ".join([f"NSE:{o.ticker}" for o in opportunities]))
-        print("=" * 115)
 
-    # Automatically generate Pine Script v6 strategy file
-    output_pine_file = "strategy_v6.pine"
-    pine_script_content = generate_pine_script_v6(output_pine_file)
-    print(f"\n[+] Successfully generated '{output_pine_file}' for TradingView backtesting.")
-    print("-" * 115)
-    print("PINE SCRIPT v6 STRATEGY CODE (COPY & PASTE INTO TRADINGVIEW PINE EDITOR):")
-    print("-" * 115)
-    print(pine_script_content)
+def merge_and_display() -> None:
+    print("\n" + "=" * 115)
+    print(f"{'MERGING ALL SHARD ARTIFACTS & COMPUTING MASTER RANKING':^115}")
     print("=" * 115)
+
+    csv_files = glob.glob("results_shard_*.csv")
+    if not csv_files:
+        print("[-] No shard CSV files found to merge.")
+        return
+
+    dfs = [pd.read_csv(f) for f in csv_files if os.path.exists(f) and os.path.getsize(f) > 0]
+    if not dfs:
+        print("[-] Shard files are empty.")
+        return
+
+    merged_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["ticker"])
+    if merged_df.empty:
+        print("[-] No opportunities found across all shards.")
+        return
+
+    merged_df.sort_values(by="fitness_score", ascending=False, inplace=True)
+    merged_df.to_csv("final_ranked_results.csv", index=False)
+
+    header = f"{'Ticker':<12}{'Signal':<6}{'Entry (₹)':<12}{'Target (+5%)':<14}{'Stop Loss':<12}{'R:R':<8}{'ML Prob (%)':<14}{'OOS Win %':<12}{'Max DD %':<10}{'Fitness':<10}"
+    print(header)
+    print("-" * 115)
+    for _, row in merged_df.iterrows():
+        print(f"{row['ticker']:<12}{row['direction']:<6}{row['entry_price']:<12.2f}{row['target_price']:<14.2f}"
+              f"{row['stop_loss']:<12.2f}{row['risk_reward']:<8.2f}{row['ensemble_prob']:<14.1f}"
+              f"{row['historical_win_rate']:<12.1f}{row['max_drawdown']:<10.1f}{row['fitness_score']:<10.3f}")
+
+    print("=" * 115)
+    tv_symbols = ", ".join([f"NSE:{t}" for t in merged_df['ticker'].tolist()])
+    print("TRADINGVIEW WATCHLIST EXPORT:")
+    print(tv_symbols)
+    print("=" * 115)
+
+    # Generate the Pine Script v6 Strategy
+    generate_pine_script_v6("strategy_v6.pine")
+    print("[+] Generated 'strategy_v6.pine' for TradingView.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Distributed Intraday ML Engine")
+    parser.add_argument("--shard-id", type=int, default=0, help="Current shard index (0-indexed)")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
+    parser.add_argument("--ticker-file", type=str, default="tickers.txt", help="Path to tickers.txt")
+    parser.add_argument("--output-csv", type=str, default="shard_results.csv", help="Intermediate output CSV")
+    parser.add_argument("--merge", action="store_true", help="Merge all shard results into final ranking")
+
+    args = parser.parse_args()
+
+    if args.merge:
+        merge_and_display()
+    else:
+        run_shard(args.shard_id, args.num_shards, args.ticker_file, args.output_csv)
 
 
 if __name__ == "__main__":
