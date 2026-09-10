@@ -9,14 +9,18 @@ on:
 
 jobs:
   # =========================================================================
-  # 1. PARALLEL SHARD PROCESSING (Runs 4 Cloud VMs in Parallel)
+  # 1. PARALLEL SHARD PROCESSING (4 Cloud VMs running concurrently)
   # =========================================================================
   screen-shards:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: # 4 Shards (Change to for 8 shards)
+        shard:
+          - 0
+          - 1
+          - 2
+          - 3
 
     steps:
       - name: Check out repository
